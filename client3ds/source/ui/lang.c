@@ -86,6 +86,10 @@ static const char *const s_strings[LANG_COUNT][S_COUNT] = {
 		[S_QUEUE_EMPTY]       = "La cola esta vacia",
 		[S_QUEUE_DLING]       = "Descargando",
 		[S_UPNEXT]            = "A continuacion",
+		[S_ARTIST]            = "ARTISTA",
+		[S_ALBUM]             = "ALBUM",
+		[S_IN_QUEUE]          = "En cola",
+		[S_H_HOLD_ROW]        = "Mantener una fila - Sonar despues",
 	},
 	[LANG_EN] = {
 		[S_NOTHING_PLAYING]   = "Nothing playing",
@@ -168,6 +172,10 @@ static const char *const s_strings[LANG_COUNT][S_COUNT] = {
 		[S_QUEUE_EMPTY]       = "The queue is empty",
 		[S_QUEUE_DLING]       = "Downloading",
 		[S_UPNEXT]            = "Up next",
+		[S_ARTIST]            = "ARTIST",
+		[S_ALBUM]             = "ALBUM",
+		[S_IN_QUEUE]          = "Queued",
+		[S_H_HOLD_ROW]        = "Hold a row - Play next",
 	},
 };
 

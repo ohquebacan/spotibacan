@@ -26,6 +26,40 @@ static void copy_str(char *dst, size_t cap, const pbv *v)
 	dst[n] = '\0';
 }
 
+/* The base62 a 16-byte gid maps to, the same alphabet librespot writes:
+ * big-endian 128-bit, divided down. The metadata answers carry gids, the
+ * rest of the client speaks URIs, and this is the only bridge. */
+static void base62_gid(const uint8_t gid[16], char out[23])
+{
+	static const char ABC[] =
+	    "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+	uint8_t n[16];
+	memcpy(n, gid, 16);
+	char tmp[23];
+	int ntmp = 0;
+	for (int i = 0; i < 22; i++) {
+		unsigned rem = 0;
+		for (int j = 0; j < 16; j++) {
+			unsigned cur = (unsigned)n[j] + (rem << 8);
+			n[j] = (uint8_t)(cur / 62);
+			rem = cur % 62;
+		}
+		tmp[ntmp++] = ABC[rem];
+	}
+	tmp[ntmp] = '\0';
+	for (int i = 0; i < ntmp; i++)
+		out[i] = tmp[ntmp - 1 - i];
+	out[ntmp] = '\0';
+}
+
+static void uri_from_gid(char *out, size_t cap, const char *kind,
+                         const uint8_t gid[16])
+{
+	char b62[23];
+	base62_gid(gid, b62);
+	snprintf(out, cap, "spotify:%s:%s", kind, b62);
+}
+
 /* Collects the image ids of a container holding repeated Image entries under
  * `field`, indexed by the Image.size enum: 0=DEFAULT (300px), 1=SMALL (64px),
  * 2=LARGE (640px). Image is { file_id 1, size 2 }; the id becomes the URL in
@@ -205,6 +239,9 @@ int sp_track_metadata(const char *host, const char *token, const char *track_uri
 		out->duration_ms = (int)dur;
 	if (pb_get_bytes(track.p, track.len, 3, &v)) {    /* Track.album */
 		pbv an;
+		if (pb_get_bytes(v.p, v.len, 1, &an) && an.len == 16)
+			uri_from_gid(out->album_uri, sizeof(out->album_uri), "album",
+			             an.p);
 		if (pb_get_bytes(v.p, v.len, 2, &an))         /* Album.name */
 			copy_str(out->album, sizeof(out->album), &an);
 	}
@@ -213,6 +250,9 @@ int sp_track_metadata(const char *host, const char *token, const char *track_uri
 		pbv an;
 		/* Artist.gid is field 1 and Artist.name is field 2; reading the first
 		 * field here would hand back raw bytes that are not text. */
+		if (pb_get_bytes(v.p, v.len, 1, &an) && an.len == 16)
+			uri_from_gid(out->artist_uri, sizeof(out->artist_uri), "artist",
+			             an.p);
 		if (pb_get_bytes(v.p, v.len, 2, &an))
 			copy_str(out->artist, sizeof(out->artist), &an);
 	}
@@ -532,12 +572,20 @@ static int metadata_batch_request(const char *host, http_session *sess,
 					out[filled].duration_ms = (int)dur;
 				if (pb_get_bytes(track.p, track.len, 3, &v)) {
 					pbv an;
+					if (pb_get_bytes(v.p, v.len, 1, &an) && an.len == 16)
+						uri_from_gid(out[filled].album_uri,
+						             sizeof(out[filled].album_uri),
+						             "album", an.p);
 					if (pb_get_bytes(v.p, v.len, 2, &an))
 						copy_str(out[filled].album, sizeof(out[filled].album), &an);
 				}
 				read_cover_urls(&track, &out[filled]);
 				if (pb_get_bytes(track.p, track.len, 4, &v)) {
 					pbv an;
+					if (pb_get_bytes(v.p, v.len, 1, &an) && an.len == 16)
+						uri_from_gid(out[filled].artist_uri,
+						             sizeof(out[filled].artist_uri),
+						             "artist", an.p);
 					if (pb_get_bytes(v.p, v.len, 2, &an))
 						copy_str(out[filled].artist, sizeof(out[filled].artist), &an);
 				}
@@ -670,6 +718,111 @@ int sp_radio(const char *host, const char *token, const char *seed_uri,
 	if (n == 0)
 		snprintf(err, errlen, "radio returned no tracks");
 	return n;
+}
+
+/* ----------------------------------------------------- album / artist views */
+
+/* Fills one brief from a metadata Track entry: gid -> URI, name, first
+ * artist, small cover. The same shapes the batch parser reads. */
+static void track_brief(const pbv *track, sp_brief *b)
+{
+	pbv v;
+	memset(b, 0, sizeof(*b));
+	if (pb_get_bytes(track->p, track->len, 1, &v) && v.len == 16)
+		uri_from_gid(b->uri, sizeof(b->uri), "track", v.p);
+	if (pb_get_bytes(track->p, track->len, 2, &v))
+		copy_str(b->name, sizeof(b->name), &v);
+	if (pb_get_bytes(track->p, track->len, 4, &v)) {
+		pbv an;
+		if (pb_get_bytes(v.p, v.len, 2, &an))
+			copy_str(b->artist, sizeof(b->artist), &an);
+	}
+	sp_track tmp;
+	memset(&tmp, 0, sizeof(tmp));
+	read_cover_urls(track, &tmp);
+	snprintf(b->art_small, sizeof(b->art_small), "%s", tmp.art_small);
+}
+
+static int brief_get(const char *host, const char *path, const char *token,
+                     int disc_field, int top_field, sp_brief *out, int max,
+                     char *name, size_t namelen, int *count,
+                     char *err, size_t errlen)
+{
+	http_reply r;
+	if (http_get_proto(host, path, token, &r) != 0) {
+		snprintf(err, errlen, "metadata: %s", r.err);
+		return -1;
+	}
+	if (r.status != 200) {
+		snprintf(err, errlen, "metadata returned HTTP %d", r.status);
+		http_reply_free(&r);
+		return -1;
+	}
+
+	const uint8_t *body = (const uint8_t *)r.body;
+	int filled = 0, seen = 0;
+	pbv v;
+	if (name && pb_get_bytes(body, r.len, 2, &v))
+		copy_str(name, namelen, &v);
+
+	/* Album.disc (8) -> Disc.track (3); Artist.top_track (11) -> the
+	 * group's track (2). Both repeated, so walked by hand: pb_get_bytes
+	 * yields the first occurrence from the cursor, and the cursor advances
+	 * past whatever it returned. */
+	size_t at = 0;
+	while (at < r.len) {
+		pbv rest = { body + at, r.len - at };
+		pbv group;
+		if (!pb_get_bytes(rest.p, rest.len, disc_field, &group))
+			break;
+		size_t gat = 0;
+		while (gat < group.len) {
+			pbv grest = { group.p + gat, group.len - gat };
+			pbv track;
+			if (!pb_get_bytes(grest.p, grest.len, top_field, &track))
+				break;
+			if (track.len) {
+				seen++;
+				if (filled < max) {
+					track_brief(&track, &out[filled]);
+					if (out[filled].uri[0])
+						filled++;
+				}
+			}
+			gat = (size_t)(track.p + track.len - group.p);
+		}
+		at = (size_t)(group.p + group.len - body);
+	}
+
+	http_reply_free(&r);
+	if (count)
+		*count = seen;
+	if (filled == 0 && seen == 0) {
+		snprintf(err, errlen, "no tracks in a %u byte response",
+		         (unsigned)r.len);
+		return -1;
+	}
+	return filled;
+}
+
+int sp_album_tracks(const char *host, const char *token, const char *album_id,
+                    sp_brief *out, int max, char *name, size_t namelen,
+                    int *count, char *err, size_t errlen)
+{
+	char path[160];
+	snprintf(path, sizeof(path), "/metadata/4/album/%s", album_id);
+	return brief_get(host, path, token, 8, 3, out, max, name, namelen,
+	                 count, err, errlen);
+}
+
+int sp_artist_top(const char *host, const char *token, const char *artist_id,
+                  sp_brief *out, int max, char *name, size_t namelen,
+                  int *count, char *err, size_t errlen)
+{
+	char path[160];
+	snprintf(path, sizeof(path), "/metadata/4/artist/%s", artist_id);
+	return brief_get(host, path, token, 11, 2, out, max, name, namelen,
+	                 count, err, errlen);
 }
 
 /* --------------------------------------------------------- storage resolve */

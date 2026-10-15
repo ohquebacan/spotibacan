@@ -21,6 +21,8 @@ typedef enum {
 	NATIVE_SEARCH,              /* uses the query */
 	NATIVE_RADIO,               /* seeded from the selected track */
 	NATIVE_TRACKS,              /* inside one playlist */
+	NATIVE_ALBUM,               /* the playing track's album */
+	NATIVE_ARTIST,              /* the playing track's artist */
 	NATIVE_DOWNLOADS,           /* local files; the one view that works offline */
 } native_view;
 
@@ -117,6 +119,10 @@ const char  *native_profile_art(void);
 int          native_profile_art_refresh(void);
 /* The URI last asked for; empty before the first play. */
 const char  *native_now_uri(void);
+/* Where "go to album / go to artist" navigates for the playing track;
+ * empty for local files or when the metadata carried no gid. */
+const char  *native_now_album_uri(void);
+const char  *native_now_artist_uri(void);
 const char  *native_last_error(void);
 /* Likes/unlikes a track URI ("Me gusta"). 0 done, 1 missing scope
  * (re-pair needed), -1 other failure; on 429 *retry_after gets the server's

@@ -11,6 +11,7 @@
 #include <3ds/services/mcuhwc.h>
 #include <3ds/services/ndm.h>
 #include <citro2d.h>
+#include <time.h>
 
 #include "cfg3ds.h"
 #include "lyrics3ds.h"
@@ -166,6 +167,41 @@ static char play_labels[NATIVE_ROWS][64];
 static char play_subs[NATIVE_ROWS][40];
 static int play_count = 0;
 static int play_idx = -1;
+
+/* "Sonar despues": tracks held on the list, played before whatever the
+ * snapshot would have played next. The snapshot index does not move when
+ * the queue runs, so the list resumes where it left off afterwards. */
+#define PLAY_Q_MAX 20
+static char play_q[PLAY_Q_MAX][192];
+static char play_q_label[PLAY_Q_MAX][64];
+static char play_q_sub[PLAY_Q_MAX][40];
+static int play_qn = 0;
+
+static void queue_push(const native_row *r)
+{
+	if (play_qn >= PLAY_Q_MAX) {
+		native_log("COLA: llena, %s no entro\n", r->label);
+		return;
+	}
+	snprintf(play_q[play_qn], sizeof(play_q[0]), "%s", r->uri);
+	snprintf(play_q_label[play_qn], sizeof(play_q_label[0]), "%s", r->label);
+	snprintf(play_q_sub[play_qn], sizeof(play_q_sub[0]), "%s", r->sub);
+	play_qn++;
+	native_log("COLA: %s sonara despues (%d en cola)\n", r->label, play_qn);
+}
+
+static bool queue_shift(void)
+{
+	if (play_qn <= 0)
+		return false;
+	play_qn--;
+	memmove(play_q, play_q + 1, (size_t)play_qn * sizeof(play_q[0]));
+	memmove(play_q_label, play_q_label + 1,
+	        (size_t)play_qn * sizeof(play_q_label[0]));
+	memmove(play_q_sub, play_q_sub + 1,
+	        (size_t)play_qn * sizeof(play_q_sub[0]));
+	return true;
+}
 
 // The hardware slider owns the volume; the overlay only follows it. Mute
 // remains a local mix toggle, orthogonal to the slider.
@@ -993,10 +1029,25 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 		text_at(b, bx + bw, by + 8, 0.42f, sk->dim, C2D_AlignRight);
 	}
 
-	/* Up next: the strip under the art, free below the hinge line. Only
-	 * shown when the next track is actually predictable -- shuffle picks at
-	 * skip time and repeat-one replays this one. */
-	if (!shuffle_on && repeat_mode != 2 && play_idx >= 0) {
+	/* Up next: the strip under the art, free below the hinge line. A
+	 * non-empty queue wins -- those are the deliberate choices -- and
+	 * otherwise the snapshot's next rows show, when they are actually
+	 * predictable (shuffle picks at skip time and repeat-one replays this
+	 * one). */
+	if (play_qn > 0) {
+		float uy = 208.0f;
+		ui_text_tracked(text_buf, tr(S_IN_QUEUE),
+		                AX + par * 1.2f, ui_baseline(uy, TY_MICRO),
+		                TY_MICRO, 1.0f, sk->accent);
+		for (int i = 0; i < play_qn && i < 2; i++) {
+			char line[120];
+			snprintf(line, sizeof(line), "%s - %s", play_q_label[i],
+			         play_q_sub[i]);
+			text_fit(line, AX + 86.0f + par * 1.2f, uy - 6.0f + i * 14.0f,
+			         i == 0 ? 0.44f : 0.40f, i == 0 ? sk->dim : sk->meter,
+			         TOP_W - AX - 86.0f - 12.0f);
+		}
+	} else if (!shuffle_on && repeat_mode != 2 && play_idx >= 0) {
 		int n1 = play_idx + 1;
 		if (n1 >= play_count)
 			n1 = (repeat_mode == 1 && play_count > 0) ? 0 : -1;
@@ -1021,6 +1072,45 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 				         TOP_W - AX - 86.0f - 12.0f);
 			}
 		}
+	}
+
+	/* Status corner: clock and battery, fixed to the glass like the volume
+	 * overlay -- status does not ride the parallax layers. Polled at most
+	 * once a second: draw_top runs twice per frame and the service calls
+	 * are syscalls. The battery body is a solid frame with the fill on
+	 * top: charging breathes in the accent, one bar left turns it warm. */
+	static u64 status_at = 0;
+	static char clock_txt[8] = "--:--";
+	static u8 bat_level = 0;
+	static bool bat_charging = false;
+	if (osGetTime() - status_at > 1000) {
+		status_at = osGetTime();
+		time_t now = time(NULL);
+		struct tm *tmv = localtime(&now);
+		if (tmv)
+			snprintf(clock_txt, sizeof(clock_txt), "%02d:%02d",
+			         tmv->tm_hour, tmv->tm_min);
+		u8 lvl = 0;
+		if (R_SUCCEEDED(ptmGetBatteryLevel(&lvl)))
+			bat_level = lvl;
+		bool chg = false;
+		if (R_SUCCEEDED(ptmGetBatteryChargeState(&chg)))
+			bat_charging = chg;
+	}
+	{
+		const float bx = TOP_W - 30.0f, by = 12.0f;
+		const u32 frame = sk->dim;
+		const u32 fill = bat_charging ? sk->accent :
+		                 bat_level <= 1 ? sk->warm : sk->dim;
+		C2D_DrawRectSolid(bx, by, 0.2f, 16.0f, 8.0f, frame);
+		C2D_DrawRectSolid(bx + 16.0f, by + 2.0f, 0.2f, 2.0f, 4.0f, frame);
+		float w = 14.0f * (float)bat_level / 5.0f;
+		if (bat_charging)
+			w = 14.0f;
+		if (w > 0.0f)
+			C2D_DrawRectSolid(bx + 1.0f, by + 1.0f, 0.3f, w, 6.0f, fill);
+		text_at(clock_txt, bx - 8.0f, by - 1.0f, 0.42f, sk->dim,
+		        C2D_AlignRight);
 	}
 
 	// Last, above whatever the top screen shows: it only reports, and the
@@ -1406,7 +1496,7 @@ static void draw_help(const Skin *sk)
 	static const str_id general[] = { S_H_START, S_H_SELECT, S_H_LID };
 	static const str_id list[] = {
 		S_H_DPAD, S_H_LR_PAGE, S_H_A_OPEN, S_H_X_RADIO, S_H_SEARCH,
-		S_H_HOLD_SEARCH, S_H_DRAG_LIST,
+		S_H_HOLD_SEARCH, S_H_DRAG_LIST, S_H_HOLD_ROW,
 	};
 	static const str_id player[] = {
 		S_H_A_PAUSE, S_H_Y_MUTE, S_H_SKIP, S_H_SCRUB, S_H_MODES,
@@ -1593,6 +1683,8 @@ static void draw_bottom(const Skin *sk)
 		a.dl_active = native_dl_active(tmp_title, sizeof(tmp_title)) >= 0;
 		a.can_prev = play_idx > 0;
 		a.can_next = play_idx >= 0 && play_idx + 1 < play_count;
+		a.can_artist = native_now_artist_uri()[0] != '\0';
+		a.can_album = native_now_album_uri()[0] != '\0';
 		a.progress_ms = (long)(now_pos * 1000.0f);
 		a.duration_ms = (long)(now_dur * 1000.0f);
 		a.pressed_id = g_touch.down ? g_touch.press_id : -1;
@@ -1667,6 +1759,25 @@ static void play_index(int idx)
 	         nat_view == NATIVE_SEARCH ? lib.query : nat_arg);
 }
 
+/* Consumes one queued track, if any, as the next play. Runs before every
+ * other next-decision (repeat-one included): a queued track is the most
+ * deliberate statement of what comes next. The snapshot index stays put,
+ * so the list resumes where it left off once the queue drains. */
+static bool play_queued(void)
+{
+	if (play_qn <= 0)
+		return false;
+	char uri[192];
+	snprintf(uri, sizeof(uri), "%s", play_q[0]);
+	queue_shift();
+	native_play(uri);
+	buffering = true;
+	paused = false;
+	ndspChnSetPaused(0, false);
+	ring_clear();
+	return true;
+}
+
 // Plays a snapshot row (a manual or automatic skip). The snapshot stays the
 // context; the on-screen highlight keeps pointing at the origin view, where
 // the row index still matches if that list is the one displayed.
@@ -1709,11 +1820,30 @@ static int step_index(int dir)
 	return (t >= 0 && t < play_count) ? t : -1;
 }
 
-/* A track that finished on its own: repeat-one replays it, shuffle jumps
+/* Opens the library at a context view (the playing track's artist or
+ * album). Same trip every other drill-in makes: cancel the in-flight
+ * fetch, reset the scroll, mark the rows for reload. */
+static void open_library_view(native_view view, const char *arg,
+                              const char *title)
+{
+	lib.open = true;
+	nat_view = view;
+	snprintf(nat_arg, sizeof(nat_arg), "%s", arg);
+	snprintf(nat_title, sizeof(nat_title), "%s", title);
+	lib.sel = 0;
+	native_fetch_cancel();   /* drop the old view's in-flight fetch */
+	lib.scroll = lib.velocity = 0.0f;
+	lib_reload = true;
+}
+
+/* A track that finished on its own: a queued track comes first (that is
+ * what "sonar despues" promised), then repeat-one replays, shuffle jumps
  * anywhere, repeat-all wraps at the end, and otherwise the next row plays.
  * Anything played off-list (the shelf) simply stops. */
 static void track_ended(void)
 {
+	if (play_queued())
+		return;
 	if (repeat_mode == 2 && native_now_uri()[0]) {
 		play_uri(native_now_uri());
 		return;
@@ -1922,6 +2052,7 @@ int main(int argc, char **argv)
 		mix[0] = mix[1] = 1.0f;
 		ndspChnSetMix(0, mix);
 		mcuHwcInit();   // the overlay follows the hardware volume slider
+		ptmInit();      // the status corner reads battery level and charging
 		audio = linearAlloc(buf_bytes * WAVE_BUFFERS);
 		if (!audio) fail = "Audio memory failed.";
 	}
@@ -2168,8 +2299,7 @@ int main(int argc, char **argv)
 		}
 
 		// Player-mode touches fire on release.
-		if (!lib.open && !lyr_open && g_touch.clicked >= 0) {
-			switch (g_touch.clicked) {
+		if (!lib.open && !lyr_open && g_touch.clicked >= 0) {			switch (g_touch.clicked) {
 			case BTN_P_PLAY:
 				if (native_playback_state() == NATIVE_PLAYING) {
 					paused = !paused;
@@ -2183,9 +2313,11 @@ int main(int argc, char **argv)
 				break;
 			}
 			case BTN_P_NEXT: {
-				const int t = step_index(+1);
-				if (t >= 0)
-					play_step(t);
+				if (!play_queued()) {
+					const int t = step_index(+1);
+					if (t >= 0)
+						play_step(t);
+				}
 				break;
 			}
 			case BTN_P_SHUFFLE:
@@ -2213,6 +2345,21 @@ int main(int argc, char **argv)
 				native_fetch_cancel();   /* drop the old view's in-flight fetch */
 				lib.scroll = lib.velocity = 0.0f;
 				lib_reload = true;
+				break;
+			case BTN_P_ARTIST:
+				/* From the playing track into its artist: the metadata
+				 * carried the gid, so no lookup stands between the tap
+				 * and the list. */
+				if (native_now_artist_uri()[0])
+					open_library_view(NATIVE_ARTIST,
+					                  native_now_artist_uri(),
+					                  native_now_artist());
+				break;
+			case BTN_P_ALBUM:
+				if (native_now_album_uri()[0])
+					open_library_view(NATIVE_ALBUM,
+					                  native_now_album_uri(),
+					                  native_now_album());
 				break;
 			case BTN_P_LIBRARY:
 				lib.open = true;
@@ -2366,6 +2513,17 @@ int main(int argc, char **argv)
 			else if (g_touch.clicked >= SL_ROW0)
 				activate_row(g_touch.clicked - SL_ROW0);
 
+			/* Holding a row queues it after what is playing; a tap keeps
+			 * meaning "play now". The long press cancels the tap itself,
+			 * so no row plays by accident. */
+			if (g_touch.long_pressed >= SL_ROW0) {
+				int extra = (nat_view == NATIVE_PLAYLISTS) ? 2 : 0;
+				int idx = g_touch.long_pressed - SL_ROW0 - extra;
+				if (idx >= 0 && idx < nat_count &&
+				    !nat_rows[idx].is_playlist)
+					queue_push(&nat_rows[idx]);
+			}
+
 			if (down & KEY_A)
 				activate_row(lib.sel);
 			if (down & KEY_Y)
@@ -2417,12 +2575,16 @@ int main(int argc, char **argv)
 		}
 
 		// D-pad left/right are the physical prev/next; shuffle may reroute
-		// them to a random row.
+		// them to a random row, and the queue answers a forward skip first.
 		if (!lib.open && !lyr_open && (down & (KEY_DLEFT | KEY_DRIGHT))) {
 			const int dir = (down & KEY_DRIGHT) ? +1 : -1;
-			const int t = step_index(dir);
-			if (t >= 0)
-				play_step(t);
+			if (dir > 0 && play_queued())
+				;
+			else {
+				const int t = step_index(dir);
+				if (t >= 0)
+					play_step(t);
+			}
 		}
 
 		// L/R are the physical prev/next: with the lid closed they are the
@@ -2430,9 +2592,13 @@ int main(int argc, char **argv)
 		// so these keys are free for the job that actually needs them.
 		if (!lib.open && !lyr_open && (down & (KEY_L | KEY_R))) {
 			const int dir = (down & KEY_R) ? +1 : -1;
-			const int t = step_index(dir);
-			if (t >= 0)
-				play_step(t);
+			if (dir > 0 && play_queued())
+				;
+			else {
+				const int t = step_index(dir);
+				if (t >= 0)
+					play_step(t);
+			}
 		}
 
 		// The overlay mirrors the hardware slider; any move pops it up.
@@ -2532,6 +2698,7 @@ quit:
 	C3D_Fini();
 	ndspExit();
 	mcuHwcExit();
+	ptmExit();
 	socExit();
 	gfxExit();
 	return 0;

@@ -79,6 +79,8 @@ static const char *view_name(native_view v)
 	case NATIVE_SEARCH:    return "search";
 	case NATIVE_RADIO:     return "radio";
 	case NATIVE_TRACKS:    return "tracks";
+	case NATIVE_ALBUM:     return "album";
+	case NATIVE_ARTIST:    return "artist";
 	case NATIVE_DOWNLOADS: return "downloads";
 	}
 	return "?";
@@ -175,6 +177,10 @@ static struct {
 	char          title[128];
 	char          artist[128];
 	char          album[128];
+	/* "Go to album / artist" targets for the playing track, from the
+	 * metadata gids. Empty for local files or missing gids. */
+	char          now_album_uri[40];
+	char          now_artist_uri[40];
 	char          art[200];
 	char          profile_art[80];   /* the user's own avatar, for the idle hero */
 	char          error[192];
@@ -353,6 +359,9 @@ const char *native_now_album(void)  { return g.album; }
 /* The URI last asked for, so the lyrics view can tell its document belongs
  * to what is playing. Empty before the first play. */
 const char *native_now_uri(void)    { return g.want; }
+/* "Go to" targets; empty for local files or when the metadata had no gids. */
+const char *native_now_album_uri(void)  { return g.now_album_uri; }
+const char *native_now_artist_uri(void) { return g.now_artist_uri; }
 const char *native_now_art(void)    { return g.art; }
 const char *native_profile_art(void) { return g.profile_art; }
 
@@ -1002,6 +1011,10 @@ static void player_thread(void *arg)
 			snprintf(g.title, sizeof(g.title), "%s", job->ts.meta.name);
 			snprintf(g.artist, sizeof(g.artist), "%s", job->ts.meta.artist);
 			snprintf(g.album, sizeof(g.album), "%s", job->ts.meta.album);
+			snprintf(g.now_album_uri, sizeof(g.now_album_uri), "%s",
+			         job->ts.meta.album_uri);
+			snprintf(g.now_artist_uri, sizeof(g.now_artist_uri), "%s",
+			         job->ts.meta.artist_uri);
 			snprintf(g.art, sizeof(g.art), "%s", job->ts.meta.art_large);
 
 			/* The download runs beside the decoder. An arm that landed
@@ -1609,6 +1622,39 @@ int native_fetch(native_view view, const char *arg, native_row *rows, int max,
 		for (int i = 0; i < n; i++)
 			snprintf(uris[i], sizeof(uris[i]), "%s", radio[i].uri);
 		return name_tracks(uris, n, rows, max, err, errlen);
+	}
+	case NATIVE_ALBUM:
+	case NATIVE_ARTIST: {
+		/* arg is the album/artist URI; the metadata/4 answer carries named
+		 * Track entries inline, so unlike playlists the rows fill directly
+		 * with no naming round trip. */
+		const char *prefix = view == NATIVE_ALBUM ? "spotify:album:"
+		                                          : "spotify:artist:";
+		const size_t plen = strlen(prefix);
+		if (!arg || strncmp(arg, prefix, plen) != 0) {
+			snprintf(err, errlen, "no %s in view argument",
+			         view == NATIVE_ALBUM ? "album" : "artist");
+			return -1;
+		}
+		static sp_brief briefs[128];
+		char name[128];
+		int count = 0;
+		int n = (view == NATIVE_ALBUM ? sp_album_tracks : sp_artist_top)
+		    (g.sp_host, token, arg + plen, briefs,
+		     (int)(sizeof(briefs) / sizeof(briefs[0])), name, sizeof(name),
+		     &count, err, errlen);
+		if (n < 0)
+			return -1;
+		for (int i = 0; i < n; i++) {
+			snprintf(rows[i].label, sizeof(rows[i].label), "%s",
+			         briefs[i].name[0] ? briefs[i].name : "(sin nombre)");
+			snprintf(rows[i].sub, sizeof(rows[i].sub), "%s", briefs[i].artist);
+			snprintf(rows[i].uri, sizeof(rows[i].uri), "%s", briefs[i].uri);
+			snprintf(rows[i].art, sizeof(rows[i].art), "%s",
+			         briefs[i].art_small);
+			rows[i].is_playlist = false;
+		}
+		return n;
 	}
 	}
 	snprintf(err, errlen, "unknown view");

@@ -31,6 +31,8 @@ enum {
 	BTN_P_LIKE,
 	BTN_P_DOWNLOAD,
 	BTN_P_QUEUE,
+	BTN_P_ARTIST,
+	BTN_P_ALBUM,
 	BTN_P_RECENT0 = 0x10,   /* + index: replay a shelf item */
 };
 
@@ -54,6 +56,8 @@ typedef struct {
 	int  dl_queue;        /* tracks waiting in the download queue */
 	bool dl_active;       /* the queue is downloading something now */
 	bool can_prev, can_next; /* no neighbour in the current view: greyed */
+	bool can_artist, can_album; /* the playing track carries album/artist
+	                             gids: the go-to buttons answer */
 
 	long progress_ms;
 	long duration_ms;

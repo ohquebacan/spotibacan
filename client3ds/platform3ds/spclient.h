@@ -37,6 +37,10 @@ typedef struct {
 	char    name[128];
 	char    artist[128];
 	char    album[128];
+	/* Where "go to artist / go to album" navigates: built from the gids the
+	 * metadata carries. Empty when the response had none. */
+	char    album_uri[40];
+	char    artist_uri[40];
 	/* Cover art as full i.scdn.co URLs: small (64px) for list rows, large
 	 * (300px) for the now-playing screen. Empty when the album carries no
 	 * images. */
@@ -46,6 +50,16 @@ typedef struct {
 	sp_file files[SP_MAX_FILES];
 	int     file_count;
 } sp_track;
+
+/* A row's worth of track data for views whose answer already carries names
+ * inline (album discs, artist top tracks): no audio files, no batch naming
+ * round trip. */
+typedef struct {
+	char uri[40];        /* spotify:track:<base62>, built from the gid */
+	char name[128];
+	char artist[128];
+	char art_small[80];
+} sp_brief;
 
 /* Which spclient host to use. Falls back to the well-known name when apresolve
  * has nothing to say, which is what librespot does too. */
@@ -104,6 +118,22 @@ int  sp_rootlist(const char *host, const char *token, const char *username,
 int  sp_playlist(const char *host, const char *token, const char *playlist_id,
                  char *name, size_t namelen, char uris[][64], int max,
                  int *count, char *err, size_t errlen);
+
+/* The tracks of one album, in disc and track order. The metadata/4 answer
+ * carries full Track entries inline, so the rows come back named. `name`
+ * gets the album title, `count` the total the album reports (which can
+ * exceed `max`). Returns how many rows were filled, or -1. */
+int  sp_album_tracks(const char *host, const char *token, const char *album_id,
+                     sp_brief *out, int max, char *name, size_t namelen,
+                     int *count, char *err, size_t errlen);
+
+/* The artist's top tracks, same compact shape as the album view. librespot
+ * protocol: Artist.top_track (11) is a per-country group whose repeated
+ * track (2) is what a row needs; the first group is plenty for this
+ * screen. */
+int  sp_artist_top(const char *host, const char *token, const char *artist_id,
+                   sp_brief *out, int max, char *name, size_t namelen,
+                   int *count, char *err, size_t errlen);
 
 /* Liked Songs. This one answers JSON, not protobuf, and carries the whole
  * first page inline. An empty page means an empty library, not a failure --
