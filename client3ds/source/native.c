@@ -144,6 +144,9 @@ static void save_download(const track_stream *ts);
 static struct {
 	bool          ready;
 	login5_token  l5;
+	/* Serialises token refreshes: the player thread, the metadata fetch
+	 * and the download queue all read g.l5, and a refresh rewrites it. */
+	LightLock     l5_lock;
 	char          sp_host[128];
 	char          username[128];
 	ap_session   *ap;
@@ -829,6 +832,41 @@ static void play_local(const char *name)
 	nlog("PLAY local fin: %u frames\n", g.frames_out);
 }
 
+/* The login5 token carries a ~1 h expiry, after which spclient answers
+ * 401 and every list fetch fails until the app restarts. The login5
+ * response hands back fresh reusable credentials, so an expired token can
+ * be traded for a new one without re-entering through the access point.
+ * Callers get a copy of the current token; the refresh itself happens
+ * under l5_lock, at most one thread at a time. A failed refresh backs off
+ * for a minute so a network outage does not hammer login5 on every call. */
+static void l5_token(char *out, size_t outlen)
+{
+	LightLock_Lock(&g.l5_lock);
+	time_t now = time(NULL);
+	if (now >= g.l5.expires_at) {
+		if (g.l5.stored_len > 0) {
+			login5_token fresh;
+			char err[192] = "";
+			if (login5_from_credentials(g.username, g.l5.stored,
+			                            g.l5.stored_len, g.device_id,
+			                            &fresh, err, sizeof(err)) == 0) {
+				nlog("L5: token renovado (quedan %ld s)\n",
+				     (long)(fresh.expires_at - now));
+				g.l5 = fresh;
+			} else {
+				nlog("L5: renovacion fallo (%s); reintento en 60 s\n",
+				     err);
+				g.l5.expires_at = time(NULL) + 60;
+			}
+		} else {
+			nlog("L5: sin credenciales reutilizables; no se puede renovar\n");
+			g.l5.expires_at = time(NULL) + 60;
+		}
+	}
+	snprintf(out, outlen, "%s", g.l5.access_token);
+	LightLock_Unlock(&g.l5_lock);
+}
+
 /* Rebuilds the access point session with the credentials kept from init.
  * The access token may have expired since, so one token refresh is tried
  * before giving up. Runs on the player thread, the only owner of g.ap. */
@@ -933,7 +971,9 @@ static void player_thread(void *arg)
 			}
 			snprintf(job->uri, sizeof(job->uri), "%s", uri);
 			char err[192];
-			int rc = track_stream_begin(g.sp_host, g.l5.access_token, g.ap,
+			char token[sizeof(g.l5.access_token)];
+			l5_token(token, sizeof(token));
+			int rc = track_stream_begin(g.sp_host, token, g.ap,
 			                            uri, NULL, &job->ts, err, sizeof(err));
 			if (rc != 0 &&
 			    (strstr(err, "key request") || strstr(err, "audio key") ||
@@ -948,7 +988,7 @@ static void player_thread(void *arg)
 					g.ap = NULL;
 				}
 				if (ap_reconnect())
-					rc = track_stream_begin(g.sp_host, g.l5.access_token,
+					rc = track_stream_begin(g.sp_host, token,
 					                        g.ap, uri, NULL, &job->ts, err,
 					                        sizeof(err));
 			}
@@ -1102,8 +1142,10 @@ static void player_thread(void *arg)
 				if (job)
 					snprintf(job->uri, sizeof(job->uri), "%s", e.uri);
 				char err[192];
+				char token[sizeof(g.l5.access_token)];
+				l5_token(token, sizeof(token));
 				int rc = job ? track_stream_begin(g.sp_host,
-				                   g.l5.access_token, g.ap, e.uri,
+				                   token, g.ap, e.uri,
 				                   NULL, &job->ts, err, sizeof(err)) : -1;
 				if (rc != 0) {
 					nlog("DLQ: no se pudo empezar %s (%s)\n", e.title,
@@ -1293,6 +1335,7 @@ int native_init(const native_sink *sink, void (*progress)(const char *step),
 	if (login5_from_credentials(info.username, info.reusable, info.reusable_len,
 	                            device_id, &g.l5, err, errlen) != 0)
 		return -1;
+	LightLock_Init(&g.l5_lock);
 
 	char ignored[128];
 	sp_resolve(g.sp_host, sizeof(g.sp_host), ignored, sizeof(ignored));
@@ -1374,6 +1417,8 @@ static int name_tracks(char uris[][64], int n, native_row *rows, int max,
 	 * costs ~3 s with its own handshake and well under one over an open
 	 * link. NULL session = the old one-shot path, still correct. */
 	http_session *sess = http_session_open(g.sp_host);
+	char token[sizeof(g.l5.access_token)];
+	l5_token(token, sizeof(token));
 	int done = 0;
 	for (int base = 0; base < n; base += 50) {
 		if (fetch_cancel) {
@@ -1388,9 +1433,9 @@ static int name_tracks(char uris[][64], int n, native_row *rows, int max,
 		TickCounter t;
 		osTickCounterStart(&t);
 		int named = sess
-		    ? sp_track_metadata_batch_s(sess, g.l5.access_token, ptrs,
+		    ? sp_track_metadata_batch_s(sess, token, ptrs,
 		                                chunk, meta, err, errlen)
-		    : sp_track_metadata_batch(g.sp_host, g.l5.access_token, ptrs,
+		    : sp_track_metadata_batch(g.sp_host, token, ptrs,
 		                              chunk, meta, err, errlen);
 		osTickCounterUpdate(&t);
 		nlog("  chunk %d..%d -> %d named%s%s (%.0f ms%s)\n", base,
@@ -1494,7 +1539,8 @@ int native_fetch(native_view view, const char *arg, native_row *rows, int max,
 	}
 
 	static char uris[NATIVE_ROWS][64];
-	const char *token = g.l5.access_token;
+	char token[sizeof(g.l5.access_token)];
+	l5_token(token, sizeof(token));
 	fetch_cancel = false;   /* a cancel aimed at the previous fetch dies here */
 
 	nlog("FETCH %s arg=%s max=%d\n", view_name(view), arg ? arg : "-", max);
@@ -1578,6 +1624,8 @@ int native_playlist_name(const char *uri, char *name, size_t namelen)
 	char err[160];
 	char throwaway[1][64];
 	int count = 0;
-	return sp_playlist(g.sp_host, g.l5.access_token, uri + 17, name, namelen,
+	char token[sizeof(g.l5.access_token)];
+	l5_token(token, sizeof(token));
+	return sp_playlist(g.sp_host, token, uri + 17, name, namelen,
 	                   throwaway, 1, &count, err, sizeof(err)) < 0 ? -1 : 0;
 }

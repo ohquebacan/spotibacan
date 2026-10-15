@@ -67,9 +67,17 @@ static struct {
 	char                     ticket_host[TLS_TICKET_SLOTS][128];
 	bool                     have_ticket[TLS_TICKET_SLOTS];
 	int                      ticket_next;
+	/* The ring and the DRBG below are shared by every network thread --
+	 * player, metadata fetch, download queue, art worker -- and mbedTLS
+	 * contexts are not thread-safe: one handshake freeing or rewriting a
+	 * slot while another was copying it surfaced as a data abort in
+	 * poll() when tracks were skipped quickly. One lock covers both; no
+	 * critical section nests inside another. */
+	LightLock                lock;
 } g;
 
-/* The matching slot, or the next victim when the host has none yet. */
+/* The matching slot, or the next victim when the host has none yet.
+ * g.lock must be held: the ring is shared by all network threads. */
 static int ticket_slot(const char *host, bool *found)
 {
 	for (int i = 0; i < TLS_TICKET_SLOTS; i++)
@@ -97,6 +105,10 @@ int tls_anchor_count(void) { return g.anchor_count; }
 
 int tls_global_init(void)
 {
+	/* (Re)created on every init: tls_global_exit() memsets the whole
+	 * globals struct, lock included. */
+	LightLock_Init(&g.lock);
+
 	if (g.ready)
 		return 0;
 
@@ -230,6 +242,18 @@ static int dial(const char *host, u16 port, int timeout_ms,
 
 /* ---------------------------------------------------------------- handshake */
 
+/* The DRBG is as shared as the ring: every handshake draws random from the
+ * same context, and ctr_drbg keeps its reseed state between calls. Same
+ * lock as the ticket ring; the RNG callback never runs while the caller
+ * holds it (ticket lookups and saves happen outside the handshake). */
+static int drbg_random(void *ctx, unsigned char *buf, size_t len)
+{
+	LightLock_Lock(&g.lock);
+	int rc = mbedtls_ctr_drbg_random(ctx, buf, len);
+	LightLock_Unlock(&g.lock);
+	return rc;
+}
+
 tls_conn *tls_connect(const char *host, u16 port, int timeout_ms,
                       tls_stats *stats, char *err, size_t errlen)
 {
@@ -271,7 +295,7 @@ tls_conn *tls_connect(const char *host, u16 port, int timeout_ms,
 	mbedtls_ssl_conf_max_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_2);
 	mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
 	mbedtls_ssl_conf_ca_chain(&c->conf, &g.anchors, NULL);
-	mbedtls_ssl_conf_rng(&c->conf, mbedtls_ctr_drbg_random, &g.drbg);
+	mbedtls_ssl_conf_rng(&c->conf, drbg_random, &g.drbg);
 	mbedtls_ssl_conf_ciphersuites(&c->conf, SUITES);
 	mbedtls_ssl_conf_groups(&c->conf, GROUPS);
 	mbedtls_ssl_conf_session_tickets(&c->conf, MBEDTLS_SSL_SESSION_TICKETS_ENABLED);
@@ -285,9 +309,12 @@ tls_conn *tls_connect(const char *host, u16 port, int timeout_ms,
 	if ((rc = mbedtls_ssl_set_hostname(&c->ssl, host)))
 		goto fail;
 	bool found = false;
-	const int slot = ticket_slot(host, &found);
+	int slot;
+	LightLock_Lock(&g.lock);
+	slot = ticket_slot(host, &found);
 	if (found)
 		mbedtls_ssl_set_session(&c->ssl, &g.ticket[slot]);
+	LightLock_Unlock(&g.lock);
 
 	mbedtls_ssl_set_bio(&c->ssl, c, bio_send, bio_recv, NULL);
 
@@ -333,7 +360,9 @@ tls_conn *tls_connect(const char *host, u16 port, int timeout_ms,
 
 	/* Keep the ticket for the next connection to this host. The slot lookup
 	 * already ran before the handshake: a match is refreshed in place, a miss
-	 * lands on the ring's next victim. */
+	 * lands on the ring's next victim. Held again here so the free+copy is
+	 * atomic against other threads copying the same slot. */
+	LightLock_Lock(&g.lock);
 	mbedtls_ssl_session_free(&g.ticket[slot]);
 	mbedtls_ssl_session_init(&g.ticket[slot]);
 	if (mbedtls_ssl_get_session(&c->ssl, &g.ticket[slot]) == 0) {
@@ -342,6 +371,7 @@ tls_conn *tls_connect(const char *host, u16 port, int timeout_ms,
 	} else {
 		g.have_ticket[slot] = false;
 	}
+	LightLock_Unlock(&g.lock);
 
 	return c;
 
