@@ -10,6 +10,7 @@
 #include <3ds.h>
 #include <3ds/services/mcuhwc.h>
 #include <3ds/services/ndm.h>
+#include <3ds/services/ptmu.h>
 #include <citro2d.h>
 #include <time.h>
 
@@ -1078,10 +1079,12 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 	 * overlay -- status does not ride the parallax layers. Polled at most
 	 * once a second: draw_top runs twice per frame and the service calls
 	 * are syscalls. The battery body is a solid frame with the fill on
-	 * top: charging breathes in the accent, one bar left turns it warm. */
+	 * top: charging breathes in the accent, a fifth left turns it warm.
+	 * Percent comes from the MCU (mcu:hwc, already up for the volume
+	 * slider); charging comes from ptm:u. */
 	static u64 status_at = 0;
 	static char clock_txt[8] = "--:--";
-	static u8 bat_level = 0;
+	static u8 bat_level = 0;      /* percent, 0-100 */
 	static bool bat_charging = false;
 	if (osGetTime() - status_at > 1000) {
 		status_at = osGetTime();
@@ -1091,20 +1094,20 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 			snprintf(clock_txt, sizeof(clock_txt), "%02d:%02d",
 			         tmv->tm_hour, tmv->tm_min);
 		u8 lvl = 0;
-		if (R_SUCCEEDED(ptmGetBatteryLevel(&lvl)))
+		if (R_SUCCEEDED(MCUHWC_GetBatteryLevel(&lvl)))
 			bat_level = lvl;
-		bool chg = false;
-		if (R_SUCCEEDED(ptmGetBatteryChargeState(&chg)))
-			bat_charging = chg;
+		u8 chg = 0;
+		if (R_SUCCEEDED(PTMU_GetBatteryChargeState(&chg)))
+			bat_charging = chg != 0;
 	}
 	{
 		const float bx = TOP_W - 30.0f, by = 12.0f;
 		const u32 frame = sk->dim;
 		const u32 fill = bat_charging ? sk->accent :
-		                 bat_level <= 1 ? sk->warm : sk->dim;
+		                 bat_level <= 20 ? sk->warm : sk->dim;
 		C2D_DrawRectSolid(bx, by, 0.2f, 16.0f, 8.0f, frame);
 		C2D_DrawRectSolid(bx + 16.0f, by + 2.0f, 0.2f, 2.0f, 4.0f, frame);
-		float w = 14.0f * (float)bat_level / 5.0f;
+		float w = 14.0f * (float)bat_level / 100.0f;
 		if (bat_charging)
 			w = 14.0f;
 		if (w > 0.0f)
@@ -2052,7 +2055,7 @@ int main(int argc, char **argv)
 		mix[0] = mix[1] = 1.0f;
 		ndspChnSetMix(0, mix);
 		mcuHwcInit();   // the overlay follows the hardware volume slider
-		ptmInit();      // the status corner reads battery level and charging
+		ptmuInit();     // the status corner reads whether the battery charges
 		audio = linearAlloc(buf_bytes * WAVE_BUFFERS);
 		if (!audio) fail = "Audio memory failed.";
 	}
@@ -2698,7 +2701,7 @@ quit:
 	C3D_Fini();
 	ndspExit();
 	mcuHwcExit();
-	ptmExit();
+	ptmuExit();
 	socExit();
 	gfxExit();
 	return 0;
