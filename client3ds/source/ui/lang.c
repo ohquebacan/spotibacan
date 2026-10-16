@@ -1,5 +1,7 @@
 #include "lang.h"
 
+#include <string.h>
+
 static lang_id s_lang = LANG_ES;
 
 /* Keep the accents out of string literals the font must rasterize: the 3DS
@@ -169,6 +171,100 @@ static const char *const s_strings[LANG_COUNT][S_COUNT] = {
 		[S_QUEUE_DLING]       = "Downloading",
 		[S_UPNEXT]            = "Up next",
 	},
+	[LANG_PT] = {
+		[S_NOTHING_PLAYING]   = "Nada tocando",
+		[S_STATE_LOADING]     = "CARREGANDO",
+		[S_STATE_PAUSED]      = "PAUSADO",
+		[S_STATE_MUTED]       = "SEM SOM",
+		[S_STATE_PLAYING]     = "TOCANDO",
+		[S_LIKED]             = "Curtidas",
+		[S_LOADING]           = "Carregando",
+		[S_LOADING_DOTS]      = "Carregando...",
+		[S_EMPTY_LIST]        = "Nada por aqui",
+		[S_QUIT_TITLE]        = "Fechar o SpotiBacan?",
+		[S_CANCEL]            = "Cancelar",
+		[S_QUIT]              = "Sair",
+		[S_PLAYLIST_FALLBACK] = "Playlist",
+		[S_RADIO]             = "Radio",
+		[S_LISTS]             = "Playlists",
+		[S_SEARCH_VIEW]       = "Busca",
+		[S_SEARCH_HINT]       = "Buscar no Spotify",
+		[S_SIGNIN_FAIL]       = "Nao foi possivel entrar",
+		[S_PAIR_TITLE]        = "Vincule sua conta",
+		[S_PAIR_LINE1]        = "No navegador, acesse",
+		[S_PAIR_LINE2]        = "e digite o codigo que aparece abaixo.",
+		[S_CODE]              = "CODIGO",
+		[S_B_CANCEL]          = "B  Cancelar",
+		[S_START_QUIT]        = "START  Sair",
+		[S_STARTING]          = "Iniciando...",
+		[S_PLAY_FAIL]         = "Nao foi possivel tocar",
+		[S_PREMIUM_REQ]       = "Requer Spotify Premium ou a faixa esta indisponivel",
+		[S_LYR_SEARCHING]     = "Buscando a letra...",
+		[S_LYR_NONE]          = "Sem letra para esta musica",
+		[S_LYR_FAIL]          = "Nao foi possivel buscar",
+		[S_BACK]              = "VOLTAR",
+		[S_LYRICS]            = "LETRA",
+		[S_LIBRARY]           = "LISTA",
+		[S_SETTINGS]          = "Ajustes",
+		[S_LANGUAGE]          = "Idioma",
+		[S_ACCENT]            = "Cor de destaque",
+		[S_UNLINK]            = "Desvincular conta",
+		[S_UNLINKED_NOTE]     = "Apaga a conta; vincula de novo ao abrir.",
+		[S_BACK_MENU]         = "Voltar",
+		[S_ACCENT_GREEN]      = "Verde",
+		[S_ACCENT_PURPLE]     = "Roxo",
+		[S_ACCENT_BLUE]       = "Azul",
+		[S_ACCENT_ORANGE]     = "Laranja",
+		[S_RECENTLY]          = "TOCADAS RECENTEMENTE",
+		[S_RECENT_TITLE]      = "Recentes",
+		[S_CLEAR]             = "LIMPAR",
+		[S_HELP_TITLE]        = "Controles",
+		[S_H_SEC_GENERAL]     = "GERAL",
+		[S_H_SEC_LIST]        = "NA LISTA",
+		[S_H_SEC_PLAYER]      = "NO PLAYER",
+		[S_H_SEC_LYRICS]      = "NA LETRA",
+		[S_H_START]           = "START - Ajustes (idioma, cor, sair)",
+		[S_H_SELECT]          = "SELECT - Esta ajuda",
+		[S_H_DPAD]            = "Cima/Baixo - Mover entre as linhas",
+		[S_H_LR_PAGE]         = "L / R - Pular 5 linhas",
+		[S_H_A_OPEN]          = "A - Abrir lista ou tocar",
+		[S_H_X_RADIO]         = "X - Radio a partir da musica",
+		[S_H_SEARCH]          = "Y ou Lupa - Buscar",
+		[S_H_HOLD_SEARCH]     = "Segurar lupa - Buscas recentes",
+		[S_H_DRAG_LIST]       = "Arrastar - Rolar",
+		[S_H_A_PAUSE]         = "A - Pausar ou continuar",
+		[S_H_Y_MUTE]          = "Y - Silenciar",
+		[S_H_SKIP]            = "Esq/Dir ou L/R - Trocar de musica",
+		[S_H_SCRUB]           = "Barra - Avancar ou voltar",
+		[S_H_SHELF]           = "Capas - Tocadas recentemente",
+		[S_H_LETRA]           = "LETRA - Ver a letra",
+		[S_H_B_BACK]          = "B - Voltar",
+		[S_H_DRAG_LYR]        = "Arrastar - Rolar a letra (se nao for sync)",
+		[S_H_LID]             = "Tampa fechada - Continua tocando, L/R trocam",
+		[S_KEY_LENS]          = "Lupa",
+		[S_KEY_FINGER]        = "Dedo",
+		[S_DOWNLOADS]         = "Salvar musicas no SD",
+		[S_H_MODES]           = "Laterais - Aleatorio e repetir",
+		[S_H_HEART]           = "Coracao - Curtir (apos revincular)",
+		[S_DL_VIEW]           = "Downloads",
+		[S_OFFLINE_A]         = "A  Ouvir downloads",
+		[S_QUEUE]             = "Fila de downloads",
+		[S_QUEUE_EMPTY]       = "A fila esta vazia",
+		[S_QUEUE_DLING]       = "Baixando",
+		[S_UPNEXT]            = "A seguir",
+	},
+};
+
+static const char *const s_codes[LANG_COUNT] = {
+	[LANG_ES] = "es",
+	[LANG_EN] = "en",
+	[LANG_PT] = "pt",
+};
+
+static const char *const s_names[LANG_COUNT] = {
+	[LANG_ES] = "Espanol",
+	[LANG_EN] = "English",
+	[LANG_PT] = "Portugues",
 };
 
 void lang_set(lang_id id)
@@ -188,4 +284,22 @@ const char *tr(str_id id)
 		return "";
 	const char *s = s_strings[s_lang][id];
 	return s ? s : "";
+}
+
+const char *lang_code(lang_id id)
+{
+	return id >= 0 && id < LANG_COUNT ? s_codes[id] : s_codes[LANG_ES];
+}
+
+const char *lang_name(lang_id id)
+{
+	return id >= 0 && id < LANG_COUNT ? s_names[id] : s_names[LANG_ES];
+}
+
+lang_id lang_from_code(const char *code)
+{
+	for (int i = 0; i < LANG_COUNT; i++)
+		if (code && strcmp(code, s_codes[i]) == 0)
+			return (lang_id)i;
+	return LANG_ES;
 }

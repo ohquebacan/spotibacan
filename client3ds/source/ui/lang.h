@@ -1,10 +1,12 @@
-/* UI strings, Spanish and English. One flat enum, one table; tr() reads the
- * current language. The choice persists as lang= in spotify.cfg. */
+/* UI strings, Spanish, English and Brazilian Portuguese. One flat enum, one
+ * table; tr() reads the current language. The choice persists as lang= in
+ * spotify.cfg. */
 #pragma once
 
 typedef enum {
 	LANG_ES = 0,
 	LANG_EN,
+	LANG_PT,
 	LANG_COUNT
 } lang_id;
 
@@ -95,3 +97,9 @@ typedef enum {
 void    lang_set(lang_id id);
 lang_id lang_get(void);
 const char *tr(str_id id);
+
+/* The lang= value in spotify.cfg and the name the settings row shows. An
+ * unknown code falls back to Spanish. */
+const char *lang_code(lang_id id);
+const char *lang_name(lang_id id);
+lang_id     lang_from_code(const char *code);
