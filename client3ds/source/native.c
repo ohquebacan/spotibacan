@@ -1629,9 +1629,10 @@ int native_fetch(native_view view, const char *arg, native_row *rows, int max,
 	}
 	case NATIVE_ALBUM:
 	case NATIVE_ARTIST: {
-		/* arg is the album/artist URI; the metadata/4 answer carries named
-		 * Track entries inline, so unlike playlists the rows fill directly
-		 * with no naming round trip. */
+		/* arg is the album/artist URI. metadata/4 answers with Track
+		 * entries, but the catalogue sometimes sends them gid-only (no
+		 * name): the batch naming pass below fills those, the way
+		 * playlists do. */
 		const char *prefix = view == NATIVE_ALBUM ? "spotify:album:"
 		                                          : "spotify:artist:";
 		const size_t plen = strlen(prefix);
@@ -1651,7 +1652,7 @@ int native_fetch(native_view view, const char *arg, native_row *rows, int max,
 			return -1;
 		for (int i = 0; i < n; i++) {
 			snprintf(rows[i].label, sizeof(rows[i].label), "%s",
-			         briefs[i].name[0] ? briefs[i].name : "(sin nombre)");
+			         briefs[i].name);
 			snprintf(rows[i].sub, sizeof(rows[i].sub), "%s", briefs[i].artist);
 			snprintf(rows[i].uri, sizeof(rows[i].uri), "%s", briefs[i].uri);
 			snprintf(rows[i].art, sizeof(rows[i].art), "%s",
@@ -1661,6 +1662,39 @@ int native_fetch(native_view view, const char *arg, native_row *rows, int max,
 			snprintf(rows[i].album_uri, sizeof(rows[i].album_uri), "%s",
 			         briefs[i].album_uri);
 			rows[i].is_playlist = false;
+		}
+		/* gid-only rows get their names from the batch service. The
+		 * artist/album URIs the briefs carried must survive the pass,
+		 * so they are stashed and restored around it. */
+		bool need_names = false;
+		for (int i = 0; i < n; i++)
+			if (rows[i].uri[0] && !rows[i].label[0]) {
+				need_names = true;
+				break;
+			}
+		if (need_names) {
+			static char puris[128][64];
+			static char saved_au[128][40], saved_bu[128][40];
+			int pn = 0;
+			for (int i = 0; i < n && pn < 128; i++) {
+				if (!rows[i].uri[0])
+					continue;
+				snprintf(puris[pn], sizeof(puris[pn]), "%s", rows[i].uri);
+				snprintf(saved_au[pn], sizeof(saved_au[pn]), "%s",
+				         rows[i].artist_uri);
+				snprintf(saved_bu[pn], sizeof(saved_bu[pn]), "%s",
+				         rows[i].album_uri);
+				pn++;
+			}
+			if (name_tracks(puris, pn, rows, max, err, errlen) > 0)
+				for (int i = 0; i < pn; i++) {
+					snprintf(rows[i].artist_uri,
+					         sizeof(rows[i].artist_uri), "%s",
+					         saved_au[i]);
+					snprintf(rows[i].album_uri,
+					         sizeof(rows[i].album_uri), "%s",
+					         saved_bu[i]);
+				}
 		}
 		return n;
 	}
