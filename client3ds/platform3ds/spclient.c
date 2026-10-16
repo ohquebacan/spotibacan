@@ -808,7 +808,7 @@ static int brief_get(const char *host, const char *path, const char *token,
 	if (name && pb_get_bytes(body, r.len, 2, &v))
 		copy_str(name, namelen, &v);
 
-	/* Album.disc (8) -> Disc.track (3); Artist.top_track (11) -> the
+	/* Album.disc (11) -> Disc.track (3); Artist.top_track (4) -> the
 	 * group's track (2). Both repeated, so walked by hand: pb_get_bytes
 	 * yields the first occurrence from the cursor, and the cursor advances
 	 * past whatever it returned. */
@@ -837,12 +837,15 @@ static int brief_get(const char *host, const char *path, const char *token,
 		at = (size_t)(group.p + group.len - body);
 	}
 
+	/* Keep the reported size: http_reply_free resets len to 0, and a
+	 * "0 byte response" that was not actually zero sends the debuggung
+	 * the wrong way. */
+	const unsigned body_len = (unsigned)r.len;
 	http_reply_free(&r);
 	if (count)
 		*count = seen;
 	if (filled == 0 && seen == 0) {
-		snprintf(err, errlen, "no tracks in a %u byte response",
-		         (unsigned)r.len);
+		snprintf(err, errlen, "no tracks in a %u byte response", body_len);
 		return -1;
 	}
 	return filled;
@@ -878,7 +881,9 @@ int sp_album_tracks(const char *host, const char *token, const char *album_id,
                     sp_brief *out, int max, char *name, size_t namelen,
                     int *count, char *err, size_t errlen)
 {
-	return entity_brief_get(host, token, "album", album_id, 8, 3, out, max,
+	/* metadata.proto: Album.disc is field 11 (8 is reserved), Disc.track
+	 * is 3. */
+	return entity_brief_get(host, token, "album", album_id, 11, 3, out, max,
 	                        name, namelen, count, err, errlen);
 }
 
@@ -886,7 +891,9 @@ int sp_artist_top(const char *host, const char *token, const char *artist_id,
                   sp_brief *out, int max, char *name, size_t namelen,
                   int *count, char *err, size_t errlen)
 {
-	return entity_brief_get(host, token, "artist", artist_id, 11, 2, out, max,
+	/* metadata.proto (Spotify 1.2.52): Artist.top_track is field 4 (11 is
+	 * portrait), TopTracks.track is 2. */
+	return entity_brief_get(host, token, "artist", artist_id, 4, 2, out, max,
 	                        name, namelen, count, err, errlen);
 }
 
