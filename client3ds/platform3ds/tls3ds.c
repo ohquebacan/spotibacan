@@ -1,5 +1,6 @@
 #include "tls3ds.h"
 #include "ca_bundle.h"
+#include "http3ds.h"
 
 #include <errno.h>
 #include <netdb.h>
@@ -103,11 +104,17 @@ void tls_strerror(int code, char *out, size_t outlen)
 
 int tls_anchor_count(void) { return g.anchor_count; }
 
+/* newlib's resolver is not reentrant; see dial(). Lives here because dial
+ * does, not in the globals struct: tls_global_exit() memsets that one. */
+static LightLock dns_lock;
+
 int tls_global_init(void)
 {
 	/* (Re)created on every init: tls_global_exit() memsets the whole
 	 * globals struct, lock included. */
 	LightLock_Init(&g.lock);
+	LightLock_Init(&dns_lock);
+	http3ds_locks_init();
 
 	if (g.ready)
 		return 0;
@@ -205,7 +212,13 @@ static int dial(const char *host, u16 port, int timeout_ms,
 
 	struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
 	struct addrinfo *res = NULL;
-	if (getaddrinfo(host, service, &hints, &res) != 0 || !res) {
+	/* newlib's resolver keeps static state and is not reentrant: two threads
+	 * dialing at once (player stream + a control request) can hand back
+	 * corrupted results, so the lookup itself serializes on dns_lock. */
+	LightLock_Lock(&dns_lock);
+	int gai = getaddrinfo(host, service, &hints, &res);
+	LightLock_Unlock(&dns_lock);
+	if (gai != 0 || !res) {
 		snprintf(err, errlen, "DNS failed for %s", host);
 		return -1;
 	}

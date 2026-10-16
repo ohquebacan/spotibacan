@@ -88,4 +88,10 @@ int  http_session_last_reused(const http_session *s);
 /* Percent-encodes everything outside the unreserved set, for form bodies. */
 size_t url_encode(const char *in, char *out, size_t outlen);
 
+/* Initializes the module's internal locks. Called by tls_global_init()
+ * before any network thread starts; without it the first request would
+ * still work (zero-initialized light locks are free locks) but the call
+ * keeps the lifecycle explicit. */
+void http3ds_locks_init(void);
+
 #endif

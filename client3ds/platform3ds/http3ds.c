@@ -8,9 +8,29 @@
 #include <string.h>
 #include <strings.h>
 
+#include <3ds/synchronization.h>
+
 #define RECV_CHUNK  4096
 /* Enough for any API reply. Audio passes its own, far larger limit. */
 #define BODY_MAX    (512 * 1024)
+
+/* Up to four threads reach this layer at once (player stream, download
+ * queue, art worker, UI), while mbedTLS is built without MBEDTLS_THREADING_C
+ * and newlib's resolver keeps internal static state: two concurrent
+ * handshakes/dials corrupted shared internals and died with a null deref
+ * inside sendto()/ctr_drbg (crash dumps 6 and 7). Short-lived control
+ * requests therefore serialize on net_lock; the long-lived audio stream in
+ * http_get_url_stream deliberately stays outside so a playing track never
+ * starves metadata, and its resolver call still rides dns_lock. Lock order
+ * is always net_lock -> tls g.lock; nothing takes them the other way. */
+static LightLock net_lock;
+static LightLock dns_lock;
+
+void http3ds_locks_init(void)
+{
+	LightLock_Init(&net_lock);
+	LightLock_Init(&dns_lock);
+}
 
 /* newlib hides strcasestr behind _GNU_SOURCE; header names are few and short,
  * so a plain scan is cheaper than reasoning about feature macros. */
@@ -190,12 +210,14 @@ static int finish(tls_conn *c, size_t limit, http_reply *out)
 	return 0;
 }
 
-/* Set for the next request only; the CDN is the only caller that needs it. */
-static size_t pending_range;
-
-int http_request(const char *host, const char *path, const char *method,
-                 const char *bearer, const char *ctype, const char *accept,
-                 const void *body, size_t len, size_t limit, http_reply *out)
+/* range_bytes != 0 asks the CDN for the first N bytes; the download path is
+ * the only caller. The caller holds net_lock. */
+static int http_request_locked(const char *host, const char *path,
+                               const char *method,
+                               const char *bearer, const char *ctype,
+                               const char *accept,
+                               const void *body, size_t len, size_t limit,
+                               size_t range_bytes, http_reply *out)
 {
 	memset(out, 0, sizeof(*out));
 	if (limit == 0)
@@ -216,13 +238,12 @@ int http_request(const char *host, const char *path, const char *method,
 
 	/* The range goes into its own buffer rather than being spliced in with
 	 * ternaries: a %u conversion cannot be skipped the way a %s can, so with
-	 * no range set it still printed a stray "0" into the headers and
+	 * no range requested it still printed a stray "0" into the headers and
 	 * malformed every single request. */
 	char range[48] = "";
-	if (pending_range)
+	if (range_bytes)
 		snprintf(range, sizeof(range), "Range: bytes=0-%u\r\n",
-		         (unsigned)(pending_range - 1));
-	pending_range = 0;
+		         (unsigned)(range_bytes - 1));
 
 	int n = snprintf(head, headcap,
 	                 "%s %s HTTP/1.1\r\nHost: %s\r\n"
@@ -257,6 +278,17 @@ int http_request(const char *host, const char *path, const char *method,
 		return -1;
 	}
 	return finish(c, limit, out);
+}
+
+int http_request(const char *host, const char *path, const char *method,
+                 const char *bearer, const char *ctype, const char *accept,
+                 const void *body, size_t len, size_t limit, http_reply *out)
+{
+	LightLock_Lock(&net_lock);
+	int rc = http_request_locked(host, path, method, bearer, ctype, accept,
+	                             body, len, limit, 0, out);
+	LightLock_Unlock(&net_lock);
+	return rc;
 }
 
 int http_post_form(const char *host, const char *path, const char *body,
@@ -318,9 +350,33 @@ int http_get_url(const char *url, size_t limit, http_reply *out)
 int http_get_url_range(const char *url, size_t bytes, size_t limit,
                        http_reply *out)
 {
-	pending_range = bytes;
-	int rc = http_get_url(url, limit, out);
-	pending_range = 0;
+	memset(out, 0, sizeof(*out));
+	if (strncmp(url, "https://", 8) != 0) {
+		snprintf(out->err, sizeof(out->err), "not an https url");
+		return -1;
+	}
+
+	const char *p = url + 8;
+	const char *slash = strchr(p, '/');
+	if (!slash) {
+		snprintf(out->err, sizeof(out->err), "url has no path");
+		return -1;
+	}
+	char host[160];
+	size_t hlen = (size_t)(slash - p);
+	if (hlen >= sizeof(host)) {
+		snprintf(out->err, sizeof(out->err), "host too long");
+		return -1;
+	}
+	memcpy(host, p, hlen);
+	host[hlen] = '\0';
+
+	/* The range rides inside the locked call: a shared "pending range" set
+	 * outside the lock could leak into another thread's request. */
+	LightLock_Lock(&net_lock);
+	int rc = http_request_locked(host, slash, "GET", NULL, NULL, NULL,
+	                             NULL, 0, limit, bytes, out);
+	LightLock_Unlock(&net_lock);
 	return rc;
 }
 
@@ -745,10 +801,11 @@ drop:
 	return -1;
 }
 
-int http_session_request(http_session *s, const char *path, const char *method,
-                         const char *bearer, const char *ctype,
-                         const char *accept, const void *body, size_t len,
-                         size_t limit, http_reply *out)
+static int sess_request_locked(http_session *s, const char *path,
+                               const char *method,
+                               const char *bearer, const char *ctype,
+                               const char *accept, const void *body, size_t len,
+                               size_t limit, http_reply *out)
 {
 	memset(out, 0, sizeof(*out));
 	if (limit == 0)
@@ -768,6 +825,18 @@ int http_session_request(http_session *s, const char *path, const char *method,
 	                 limit, out, &stale) == 0)
 		return 0;
 	return -1;
+}
+
+int http_session_request(http_session *s, const char *path, const char *method,
+                         const char *bearer, const char *ctype,
+                         const char *accept, const void *body, size_t len,
+                         size_t limit, http_reply *out)
+{
+	LightLock_Lock(&net_lock);
+	int rc = sess_request_locked(s, path, method, bearer, ctype, accept,
+	                             body, len, limit, out);
+	LightLock_Unlock(&net_lock);
+	return rc;
 }
 
 int http_session_last_reused(const http_session *s)
