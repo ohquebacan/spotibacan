@@ -1572,11 +1572,17 @@ static bool queue_open = false;
 
 /* Rounded-panel idiom shared by the popups, from the reference client:
  * centre bars plus a disc in each corner, border plate one pixel proud of
- * the panel inset. r is the corner radius. */
+ * the panel inset. r is the corner radius. The shapes draw at z=0.6: the
+ * modal scrim sits at that depth too and is drawn first, so anything lower
+ * would land behind the dim -- which is exactly what made the card
+ * invisible (only the z=0.7 text showed). */
 static void rounded_rect(float x, float y, float w, float h, float r, u32 clr)
 {
-	C2D_DrawRectSolid(x + r, y, 0.0f, w - 2.0f * r, h, clr);
-	C2D_DrawRectSolid(x, y + r, 0.0f, w, h - 2.0f * r, clr);
+	/* ui_disc reads the shared ui_depth; bring it to the plate's depth so
+	 * the corner discs are not dimmed away with the scrim behind. */
+	ui_depth(0.6f);
+	C2D_DrawRectSolid(x + r, y, 0.6f, w - 2.0f * r, h, clr);
+	C2D_DrawRectSolid(x, y + r, 0.6f, w, h - 2.0f * r, clr);
 	ui_disc(x + r, y + r, r, clr);
 	ui_disc(x + w - r, y + r, r, clr);
 	ui_disc(x + r, y + h - r, r, clr);
@@ -1933,9 +1939,75 @@ static int step_index(int dir)
 /* Opens the library at a context view (the playing track's artist or
  * album). Same trip every other drill-in makes: cancel the in-flight
  * fetch, reset the scroll, mark the rows for reload. */
+/* ------------------------------------------------------- navigation stack
+ * "Back" returns to the view that opened the current one: Liked -> a
+ * track's album -> back lands on Liked again (same position), not the
+ * playlist folder. Eight levels cover playlist -> album -> artist ->
+ * album chains with room to spare. */
+static struct {
+	native_view view;
+	char        arg[192];
+	char        title[64];
+	int         sel;
+	float       scroll;
+} nav_stack[8];
+static int nav_sp;
+
+static void nav_push(void)
+{
+	if (nav_sp >= 8)
+		return;
+	nav_stack[nav_sp].view = nat_view;
+	snprintf(nav_stack[nav_sp].arg, sizeof(nav_stack[nav_sp].arg), "%s",
+	         nat_arg);
+	snprintf(nav_stack[nav_sp].title, sizeof(nav_stack[nav_sp].title), "%s",
+	         nat_title);
+	nav_stack[nav_sp].sel = lib.sel;
+	nav_stack[nav_sp].scroll = lib.scroll;
+	nav_sp++;
+}
+
+static bool nav_pop(void)
+{
+	if (nav_sp <= 0)
+		return false;
+	nav_sp--;
+	nat_view = nav_stack[nav_sp].view;
+	snprintf(nat_arg, sizeof(nat_arg), "%s", nav_stack[nav_sp].arg);
+	snprintf(nat_title, sizeof(nat_title), "%s", nav_stack[nav_sp].title);
+	lib.sel = nav_stack[nav_sp].sel;
+	native_fetch_cancel();   /* drop the old view's in-flight fetch */
+	lib.scroll = nav_stack[nav_sp].scroll;
+	lib.velocity = 0.0f;
+	lib_reload = true;
+	return true;
+}
+
+/* One back step: a popped stack entry wins; with an empty stack the
+ * legacy behaviour remains -- up to the playlist folder, and from there
+ * out of the library. */
+static void library_back(void)
+{
+	if (nav_pop())
+		return;
+	if (nat_view != NATIVE_PLAYLISTS) {
+		nat_view = NATIVE_PLAYLISTS;
+		nat_arg[0] = '\0';
+		snprintf(nat_title, sizeof(nat_title), "%s", tr(S_LISTS));
+		lib.sel = 0;
+		native_fetch_cancel();   /* drop the old view's in-flight fetch */
+		lib.scroll = lib.velocity = 0.0f;
+		lib_reload = true;
+	} else {
+		lib.open = false;
+		nav_sp = 0;
+	}
+}
+
 static void open_library_view(native_view view, const char *arg,
                               const char *title)
 {
+	nav_push();
 	lib.open = true;
 	nat_view = view;
 	snprintf(nat_arg, sizeof(nat_arg), "%s", arg);
@@ -1972,14 +2044,17 @@ static void activate_row(int abs)
 	int extra = (nat_view == NATIVE_PLAYLISTS) ? 2 : 0;
 	int idx = abs - extra;
 	if (extra && abs == 0) {
+		nav_push();
 		nat_view = NATIVE_LIKED;
 		nat_arg[0] = '\0';
 		snprintf(nat_title, sizeof(nat_title), "%s", tr(S_LIKED));
 	} else if (extra && abs == 1) {
+		nav_push();
 		nat_view = NATIVE_DOWNLOADS;
 		nat_arg[0] = '\0';
 		snprintf(nat_title, sizeof(nat_title), "%s", tr(S_DL_VIEW));
 	} else if (idx >= 0 && idx < nat_count && nat_rows[idx].is_playlist) {
+		nav_push();
 		snprintf(nat_arg, sizeof(nat_arg), "%s", nat_rows[idx].uri);
 		if (native_playlist_name(nat_arg, nat_title, sizeof(nat_title)) != 0)
 			snprintf(nat_title, sizeof(nat_title), "%s", tr(S_PLAYLIST_FALLBACK));
@@ -2338,6 +2413,7 @@ int main(int argc, char **argv)
 				snprintf(lib.query, sizeof(lib.query), "%s",
 				         srch[c - SR_ROW0]);
 				srch_push(lib.query);
+				nav_push();
 				nat_view = NATIVE_SEARCH;
 				snprintf(nat_title, sizeof(nat_title), "%s",
 				         tr(S_SEARCH_VIEW));
@@ -2459,6 +2535,7 @@ int main(int argc, char **argv)
 				break;
 			case BTN_P_QUEUE:
 				// Short press: the Downloads shelf itself.
+				nav_push();
 				lib.open = true;
 				nat_view = NATIVE_DOWNLOADS;
 				nat_arg[0] = '\0';
@@ -2605,18 +2682,13 @@ int main(int argc, char **argv)
 				srch_open = true;
 			if (g_touch.clicked == SL_BTN_SEARCH)
 				open_search = true;
-			else if (g_touch.clicked == SL_BTN_CLOSE)
+			else if (g_touch.clicked == SL_BTN_CLOSE) {
 				lib.open = false;
-			else if (g_touch.clicked == SL_BTN_BACK &&
-			         nat_view != NATIVE_PLAYLISTS) {
-				// Same trip the B button makes: up to the playlists.
-				nat_view = NATIVE_PLAYLISTS;
-				nat_arg[0] = '\0';
-				snprintf(nat_title, sizeof(nat_title), "%s", tr(S_LISTS));
-				lib.sel = 0;
-				native_fetch_cancel();   /* drop the old view's in-flight fetch */
-				lib.scroll = lib.velocity = 0.0f;
-				lib_reload = true;
+				nav_sp = 0;
+			} else if (g_touch.clicked == SL_BTN_BACK &&
+			           (nav_sp > 0 || nat_view != NATIVE_PLAYLISTS)) {
+				// Same trip the B button makes: one step back.
+				library_back();
 			}
 			else if (g_touch.clicked >= SL_ROW0)
 				activate_row(g_touch.clicked - SL_ROW0);
@@ -2646,6 +2718,7 @@ int main(int argc, char **argv)
 				if (idx >= 0 && idx < nat_count &&
 				    !nat_rows[idx].is_playlist &&
 				    strncmp(nat_rows[idx].uri, "file:", 5) != 0) {
+					nav_push();
 					snprintf(nat_arg, sizeof(nat_arg), "%s",
 					         nat_rows[idx].uri);
 					nat_view = NATIVE_RADIO;
@@ -2656,19 +2729,8 @@ int main(int argc, char **argv)
 					lib_reload = true;
 				}
 			}
-			if (down & KEY_B) {
-				if (nat_view != NATIVE_PLAYLISTS) {
-					nat_view = NATIVE_PLAYLISTS;
-					nat_arg[0] = '\0';
-					snprintf(nat_title, sizeof(nat_title), "%s", tr(S_LISTS));
-					lib.sel = 0;
-				native_fetch_cancel();   /* drop the old view's in-flight fetch */
-					lib.scroll = lib.velocity = 0.0f;
-					lib_reload = true;
-				} else {
-					lib.open = false;
-				}
-			}
+			if (down & KEY_B)
+				library_back();
 		}
 
 		if (!lib.open && (down & KEY_A)) {
