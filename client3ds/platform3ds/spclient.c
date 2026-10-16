@@ -865,7 +865,11 @@ static int entity_brief_get(const char *host, const char *token, const char *kin
 	gid_hex(gid, hex);
 
 	char path[160];
-	snprintf(path, sizeof(path), "/metadata/4/%s/%s", kind, hex);
+	/* Without a market the service answers 200 with an empty body; librespot
+	 * sends product/country, the Go clients send market=from_token, which
+	 * follows whatever market the account's token carries. */
+	snprintf(path, sizeof(path), "/metadata/4/%s/%s?market=from_token",
+	         kind, hex);
 	return brief_get(host, path, token, disc_field, top_field, out, max,
 	                 name, namelen, count, err, errlen);
 }
