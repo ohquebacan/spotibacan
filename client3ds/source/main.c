@@ -252,7 +252,7 @@ static void prefs_load(void)
 {
 	char v[16];
 	if (cfg_get("lang", v, sizeof(v)))
-		lang_set(strcmp(v, "en") == 0 ? LANG_EN : LANG_ES);
+		lang_set(lang_from_code(v));
 	if (cfg_get("accent", v, sizeof(v)))
 		for (int i = 0; i < ACCENT_COUNT; i++)
 			if (strcmp(v, ACCENT_KEYS[i]) == 0) {
@@ -1168,7 +1168,7 @@ static void draw_settings(const Skin *sk)
 		        pw - 100.0f, fg);
 		// The preference rows show their current value on the right.
 		if (i == 0) {
-			const char *v = lang_get() == LANG_EN ? "English" : "Espanol";
+			const char *v = lang_name(lang_get());
 			float w = ui_text_width(text_buf, v, TY_ROW_SUB);
 			ui_text(text_buf, v, px + pw - 16.0f - w,
 			        ui_baseline(y + 5.0f, TY_ROW_SUB), TY_ROW_SUB, w, fg);
@@ -2040,8 +2040,8 @@ int main(int argc, char **argv)
 			const int row = settings_pending;
 			settings_pending = -1;
 			if (row == 0) {
-				lang_set(lang_get() == LANG_EN ? LANG_ES : LANG_EN);
-				cfg_set("lang", lang_get() == LANG_EN ? "en" : "es");
+				lang_set((lang_get() + 1) % LANG_COUNT);
+				cfg_set("lang", lang_code(lang_get()));
 				refresh_nat_title();
 			} else if (row == 1) {
 				accent_idx = (accent_idx + 1) % ACCENT_COUNT;
