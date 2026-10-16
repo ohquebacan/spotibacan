@@ -1705,24 +1705,38 @@ static void draw_ctx_menu(const Skin *sk)
 	const u32 scrim  = C2D_Color32(0x00, 0x00, 0x00, 0x98);
 	const u32 bord   = C2D_Color32(0x38, 0x38, 0x38, 0xFF);
 	const u32 panel  = C2D_Color32(0x1B, 0x1B, 0x1B, 0xFF);
-	const u32 hilite = C2D_Color32(0x24, 0x24, 0x24, 0xFF);
+	const u32 cell   = C2D_Color32(0x24, 0x24, 0x24, 0xFF);
+	const u32 hilite = C2D_Color32(0x2E, 0x2E, 0x2E, 0xFF);
 
 	C2D_DrawRectSolid(0.0f, 0.0f, 0.6f, BOT_W, SCR_H, scrim);
 
+	const bool has_sub = ctx_row.sub[0] != '\0';
+	const float cell_h = has_sub ? 44.0f : 28.0f;
 	const int n = ctx_option_count();
-	const float ph = 40.0f + (float)n * CTX_ROW_H;
+	const float ph = 16.0f + cell_h + 10.0f + (float)n * CTX_ROW_H + 12.0f;
 	const float px = (BOT_W - CTX_W) / 2.0f;
 	const float py = (SCR_H - ph) / 2.0f;
 	round_panel(px, py, CTX_W, ph, CTX_R, bord, panel);
+
+	/* Header cell: the held track's title (and artist when known) sits in
+	 * its own slightly lighter rounded cell so it reads as context, not as
+	 * another tappable option. */
+	const float cx = px + 8.0f;
+	const float cw = CTX_W - 16.0f;
+	rounded_rect(cx, py + 8.0f, cw, cell_h, 6.0f, cell);
 
 	/* The touch map answers the first rect holding the point: options are
 	 * registered before the full-screen closer so they win inside the
 	 * card, and a tap on the scrim falls through to CTX_CLOSE. */
 	ui_depth(0.7f);
-	float y = py + 10.0f;
-	ui_text(text_buf, ctx_row.label, px + 12.0f,
-	        ui_baseline(y, TY_ROW_NAME), TY_ROW_NAME, CTX_W - 24.0f, sk->text);
-	y += 28.0f;
+	float y = py + 8.0f + (has_sub ? 7.0f : 5.0f);
+	ui_text(text_buf, ctx_row.label, cx + 10.0f,
+	        ui_baseline(y, TY_ROW_NAME), TY_ROW_NAME, cw - 20.0f, sk->text);
+	if (has_sub)
+		ui_text(text_buf, ctx_row.sub, cx + 10.0f,
+		        ui_baseline(y + 16.0f, TY_ROW_SUB), TY_ROW_SUB,
+		        cw - 20.0f, sk->dim);
+	y = py + 8.0f + cell_h + 10.0f;
 
 	static const str_id opt_str[3] = { S_PLAY_NEXT, S_GO_ARTIST, S_GO_ALBUM };
 	const bool avail[3] = { true, ctx_row.artist_uri[0] != '\0',
@@ -1732,12 +1746,11 @@ static void draw_ctx_menu(const Skin *sk)
 			continue;
 		const float top = y + (float)opt * CTX_ROW_H;
 		if (g_touch.down && g_touch.press_id == CTX_ROW0 + opt)
-			rounded_rect(px + 4.0f, top + 1.0f, CTX_W - 8.0f,
-			             CTX_ROW_H - 2.0f, 6.0f, hilite);
-		ui_text(text_buf, tr(opt_str[i]), px + 14.0f,
+			rounded_rect(cx, top + 1.0f, cw, CTX_ROW_H - 2.0f, 6.0f, hilite);
+		ui_text(text_buf, tr(opt_str[i]), cx + 12.0f,
 		        ui_baseline(top + CTX_ROW_H / 2.0f, TY_ROW_NAME), TY_ROW_NAME,
-		        CTX_W - 28.0f, sk->text);
-		tb_add(&g_tb, px + 4.0f, top, CTX_W - 8.0f, CTX_ROW_H, CTX_ROW0 + opt);
+		        cw - 24.0f, sk->text);
+		tb_add(&g_tb, cx, top, cw, CTX_ROW_H, CTX_ROW0 + opt);
 		opt++;
 	}
 	tb_add(&g_tb, 0.0f, 0.0f, BOT_W, SCR_H, CTX_CLOSE);
