@@ -18,8 +18,13 @@
  * the download watermark is ignored by the decoder.
  */
 
+/* Player touch ids live at 40+ on purpose: the list screen's ids start at 10
+ * (SL_BTN_SEARCH), and both screens are registered on the same touch builder,
+ * so a tap handled here must not double-fire as a list-screen tap in the same
+ * frame (the shell's dispatch is a flat "first rect that contains the point").
+ * BTN_P_RECENT0 stays at 0x10, which collides with nothing (0x10 == 16 > 13). */
 enum {
-	BTN_P_PLAY = 0,
+	BTN_P_PLAY = 40,
 	BTN_P_PREV,
 	BTN_P_NEXT,
 	BTN_P_LIBRARY,
@@ -56,8 +61,6 @@ typedef struct {
 	int  dl_queue;        /* tracks waiting in the download queue */
 	bool dl_active;       /* the queue is downloading something now */
 	bool can_prev, can_next; /* no neighbour in the current view: greyed */
-	bool can_artist, can_album; /* the playing track carries album/artist
-	                             gids: the go-to buttons answer */
 
 	long progress_ms;
 	long duration_ms;

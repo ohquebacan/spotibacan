@@ -93,6 +93,9 @@ typedef enum {
 	S_ALBUM,
 	S_IN_QUEUE,
 	S_H_HOLD_ROW,
+	S_PLAY_NEXT,
+	S_GO_ARTIST,
+	S_GO_ALBUM,
 	S_COUNT
 } str_id;
 

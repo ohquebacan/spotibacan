@@ -53,11 +53,13 @@ typedef struct {
 
 /* A row's worth of track data for views whose answer already carries names
  * inline (album discs, artist top tracks): no audio files, no batch naming
- * round trip. */
+ * round trip. The artist/album URIs feed the row's context menu. */
 typedef struct {
 	char uri[40];        /* spotify:track:<base62>, built from the gid */
 	char name[128];
 	char artist[128];
+	char album_uri[40];
+	char artist_uri[40];
 	char art_small[80];
 } sp_brief;
 

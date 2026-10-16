@@ -416,43 +416,11 @@ static void draw_shelf(const screen_player_args *a)
 	}
 }
 
-/* The go-to pair under the shelf: from the playing track straight into
- * its artist or album. Text, not glyphs -- the label says where it leads.
- * Hidden for local files and for metadata that carried no gids. */
-static void draw_context_links(const screen_player_args *a)
-{
-	if (!a->can_artist && !a->can_album)
-		return;
-	const float y = 120.0f;
-	const float wA = a->can_artist
-	                 ? ui_text_width(a->buf, tr(S_ARTIST), TY_MICRO) : 0.0f;
-	const float wB = a->can_album
-	                 ? ui_text_width(a->buf, tr(S_ALBUM), TY_MICRO) : 0.0f;
-	const float gap = (a->can_artist && a->can_album) ? 34.0f : 0.0f;
-	float x = 160.0f - (wA + wB + gap) / 2.0f;
-	if (a->can_artist) {
-		const u32 clr = press_clr(CLR_LABEL,
-		                          a->pressed_id == BTN_P_ARTIST, a->accent);
-		ui_text_tracked(a->buf, tr(S_ARTIST), x,
-		                ui_baseline(y, TY_MICRO), TY_MICRO, 1.0f, clr);
-		tb_add(a->tb, x - 8.0f, y - 6.0f, wA + 16.0f, 20.0f, BTN_P_ARTIST);
-		x += wA + gap;
-	}
-	if (a->can_album) {
-		const u32 clr = press_clr(CLR_LABEL,
-		                          a->pressed_id == BTN_P_ALBUM, a->accent);
-		ui_text_tracked(a->buf, tr(S_ALBUM), x,
-		                ui_baseline(y, TY_MICRO), TY_MICRO, 1.0f, clr);
-		tb_add(a->tb, x - 8.0f, y - 6.0f, wB + 16.0f, 20.0f, BTN_P_ALBUM);
-	}
-}
-
 void screen_player_draw(const screen_player_args *a)
 {
 	draw_header(a);
 	draw_centre(a);
 	draw_shelf(a);
-	draw_context_links(a);
 	draw_transport(a);
 	draw_scrubber(a);
 }

@@ -60,6 +60,40 @@ static void uri_from_gid(char *out, size_t cap, const char *kind,
 	snprintf(out, cap, "spotify:%s:%s", kind, b62);
 }
 
+/* The inverse of base62_gid: the base62 piece of a URI back into the raw
+ * 16-byte gid. metadata/4 paths take the gid as lowercase hex, never the
+ * base62 the URI shows -- asking with the base62 is what got the 404s.
+ * Multiplication carries run toward the most significant byte, so the array
+ * walks from index 15 up. */
+static bool base62_to_gid(const char *b62, uint8_t gid[16])
+{
+	static const char ABC[] =
+	    "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+	uint8_t n[16] = {0};
+	for (const char *p = b62; *p; p++) {
+		const char *q = strchr(ABC, *p);
+		if (!q)
+			return false;
+		unsigned carry = (unsigned)(q - ABC);
+		for (int j = 15; j >= 0; j--) {
+			unsigned cur = (unsigned)n[j] * 62 + carry;
+			n[j] = (uint8_t)(cur & 0xFF);
+			carry = cur >> 8;
+		}
+		if (carry)
+			return false; /* more than 128 bits: not a track gid */
+	}
+	memcpy(gid, n, 16);
+	return true;
+}
+
+/* lowercase hex of a gid, the shape metadata/4 and the CDN both want */
+static void gid_hex(const uint8_t gid[16], char out[33])
+{
+	for (int i = 0; i < 16; i++)
+		snprintf(out + i * 2, 3, "%02x", gid[i]);
+}
+
 /* Collects the image ids of a container holding repeated Image entries under
  * `field`, indexed by the Image.size enum: 0=DEFAULT (300px), 1=SMALL (64px),
  * 2=LARGE (640px). Image is { file_id 1, size 2 }; the id becomes the URL in
@@ -732,8 +766,17 @@ static void track_brief(const pbv *track, sp_brief *b)
 		uri_from_gid(b->uri, sizeof(b->uri), "track", v.p);
 	if (pb_get_bytes(track->p, track->len, 2, &v))
 		copy_str(b->name, sizeof(b->name), &v);
+	if (pb_get_bytes(track->p, track->len, 3, &v)) {
+		pbv an;
+		if (pb_get_bytes(v.p, v.len, 1, &an) && an.len == 16)
+			uri_from_gid(b->album_uri, sizeof(b->album_uri), "album",
+			             an.p);
+	}
 	if (pb_get_bytes(track->p, track->len, 4, &v)) {
 		pbv an;
+		if (pb_get_bytes(v.p, v.len, 1, &an) && an.len == 16)
+			uri_from_gid(b->artist_uri, sizeof(b->artist_uri), "artist",
+			             an.p);
 		if (pb_get_bytes(v.p, v.len, 2, &an))
 			copy_str(b->artist, sizeof(b->artist), &an);
 	}
@@ -805,24 +848,42 @@ static int brief_get(const char *host, const char *path, const char *token,
 	return filled;
 }
 
+/* The metadata/4 paths want the entity's gid as lowercase hex, not the
+ * base62 the URI carries; a base62 in this path is what answered 404. Shared
+ * shape for the album discs and the artist top-tracks calls. */
+static int entity_brief_get(const char *host, const char *token, const char *kind,
+                            const char *id, int disc_field, int top_field,
+                            sp_brief *out, int max, char *name, size_t namelen,
+                            int *count, char *err, size_t errlen)
+{
+	uint8_t gid[16];
+	char hex[33];
+	if (!base62_to_gid(id, gid)) {
+		snprintf(err, errlen, "%s id '%s' is not base62", kind, id);
+		return -1;
+	}
+	gid_hex(gid, hex);
+
+	char path[160];
+	snprintf(path, sizeof(path), "/metadata/4/%s/%s", kind, hex);
+	return brief_get(host, path, token, disc_field, top_field, out, max,
+	                 name, namelen, count, err, errlen);
+}
+
 int sp_album_tracks(const char *host, const char *token, const char *album_id,
                     sp_brief *out, int max, char *name, size_t namelen,
                     int *count, char *err, size_t errlen)
 {
-	char path[160];
-	snprintf(path, sizeof(path), "/metadata/4/album/%s", album_id);
-	return brief_get(host, path, token, 8, 3, out, max, name, namelen,
-	                 count, err, errlen);
+	return entity_brief_get(host, token, "album", album_id, 8, 3, out, max,
+	                        name, namelen, count, err, errlen);
 }
 
 int sp_artist_top(const char *host, const char *token, const char *artist_id,
                   sp_brief *out, int max, char *name, size_t namelen,
                   int *count, char *err, size_t errlen)
 {
-	char path[160];
-	snprintf(path, sizeof(path), "/metadata/4/artist/%s", artist_id);
-	return brief_get(host, path, token, 11, 2, out, max, name, namelen,
-	                 count, err, errlen);
+	return entity_brief_get(host, token, "artist", artist_id, 11, 2, out, max,
+	                        name, namelen, count, err, errlen);
 }
 
 /* --------------------------------------------------------- storage resolve */

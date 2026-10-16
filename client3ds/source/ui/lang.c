@@ -89,7 +89,10 @@ static const char *const s_strings[LANG_COUNT][S_COUNT] = {
 		[S_ARTIST]            = "ARTISTA",
 		[S_ALBUM]             = "ALBUM",
 		[S_IN_QUEUE]          = "En cola",
-		[S_H_HOLD_ROW]        = "Mantener una fila - Sonar despues",
+		[S_H_HOLD_ROW]        = "Mantener una fila - menu",
+		[S_PLAY_NEXT]         = "Sonar despues",
+		[S_GO_ARTIST]         = "Ir al artista",
+		[S_GO_ALBUM]          = "Ir al album",
 	},
 	[LANG_EN] = {
 		[S_NOTHING_PLAYING]   = "Nothing playing",
@@ -175,7 +178,10 @@ static const char *const s_strings[LANG_COUNT][S_COUNT] = {
 		[S_ARTIST]            = "ARTIST",
 		[S_ALBUM]             = "ALBUM",
 		[S_IN_QUEUE]          = "Queued",
-		[S_H_HOLD_ROW]        = "Hold a row - Play next",
+		[S_H_HOLD_ROW]        = "Hold a row - menu",
+		[S_PLAY_NEXT]         = "Play next",
+		[S_GO_ARTIST]         = "Go to artist",
+		[S_GO_ALBUM]          = "Go to album",
 	},
 };
 

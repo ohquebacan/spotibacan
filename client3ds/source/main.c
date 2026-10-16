@@ -1112,7 +1112,9 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 			w = 14.0f;
 		if (w > 0.0f)
 			C2D_DrawRectSolid(bx + 1.0f, by + 1.0f, 0.3f, w, 6.0f, fill);
-		text_at(clock_txt, bx - 8.0f, by - 1.0f, 0.42f, sk->dim,
+		/* The clock shares the battery's vertical centre: at by-1 the text
+		 * sat a couple of pixels low against the 8px-tall battery body. */
+		text_at(clock_txt, bx - 8.0f, by - 3.0f, 0.42f, sk->dim,
 		        C2D_AlignRight);
 	}
 
@@ -1128,6 +1130,8 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 // Defined with the playback helpers below; the list needs them for the
 // now-playing badge.
 static bool now_matches_view(void);
+static void open_library_view(native_view view, const char *arg,
+                              const char *title);
 
 static const C2D_Image *list_thumb(const char *url, void *ctx)
 {
@@ -1566,20 +1570,38 @@ static void draw_help(const Skin *sk)
 
 static bool queue_open = false;
 
+/* Rounded-panel idiom shared by the popups, from the reference client:
+ * centre bars plus a disc in each corner, border plate one pixel proud of
+ * the panel inset. r is the corner radius. */
+static void rounded_rect(float x, float y, float w, float h, float r, u32 clr)
+{
+	C2D_DrawRectSolid(x + r, y, 0.0f, w - 2.0f * r, h, clr);
+	C2D_DrawRectSolid(x, y + r, 0.0f, w, h - 2.0f * r, clr);
+	ui_disc(x + r, y + r, r, clr);
+	ui_disc(x + w - r, y + r, r, clr);
+	ui_disc(x + r, y + h - r, r, clr);
+	ui_disc(x + w - r, y + h - r, r, clr);
+}
+
+static void round_panel(float x, float y, float w, float h, float r,
+                        u32 border, u32 panel)
+{
+	rounded_rect(x, y, w, h, r, border);
+	rounded_rect(x + 1.0f, y + 1.0f, w - 2.0f, h - 2.0f, r - 1.0f, panel);
+}
+
 /* The download queue popup: what is downloading right now, with a progress
  * bar, and what is still waiting its turn. Refreshes itself every frame --
  * the popup is read-only, so there is nothing to scroll or select. */
 static void draw_queue(const Skin *sk)
 {
-	const u32 dim   = C2D_Color32(0x00, 0x00, 0x00, 0xA8);
+	const u32 dim   = C2D_Color32(0x00, 0x00, 0x00, 0x98);
 	const u32 bord  = C2D_Color32(0x38, 0x38, 0x38, 0xFF);
 	const u32 panel = C2D_Color32(0x1B, 0x1B, 0x1B, 0xFF);
 
 	C2D_DrawRectSolid(0.0f, 0.0f, 0.6f, BOT_W, SCR_H, dim);
 	const float px = 14.0f, py = 8.0f, pw = 292.0f, ph = 224.0f;
-	C2D_DrawRectSolid(px, py, 0.6f, pw, ph, bord);
-	C2D_DrawRectSolid(px + 1.0f, py + 1.0f, 0.6f, pw - 2.0f, ph - 2.0f,
-	                  panel);
+	round_panel(px, py, pw, ph, 8.0f, bord, panel);
 
 	ui_depth(0.7f);
 	float y = py + 8.0f;
@@ -1629,6 +1651,90 @@ static void draw_queue(const Skin *sk)
 			y += 14.5f;
 		}
 	}
+	ui_depth(0.0f);
+}
+
+/* -------------------------------------------------- row context menu
+ * Holding a row offers what used to crowd the player screen: play next,
+ * go to the artist, go to the album. The row is snapshotted on open, so
+ * a list refresh underneath cannot corrupt the choices. */
+static bool ctx_open = false;
+static native_row ctx_row;
+
+#define CTX_ROW_H 30.0f
+#define CTX_W     216.0f
+#define CTX_R     8.0f
+#define CTX_ROW0  0x7400
+#define CTX_CLOSE 0x73FF
+
+static int ctx_option_count(void)
+{
+	int n = 1;   /* "sonar despues" always: any track row can queue */
+	if (ctx_row.artist_uri[0])
+		n++;
+	if (ctx_row.album_uri[0])
+		n++;
+	return n;
+}
+
+/* Runs option `opt` of the open menu; the availability test mirrors
+ * ctx_option_count so the index the touch map reported stays honest. */
+static void ctx_run(int opt)
+{
+	int n = 0;
+	if (opt == n++) {
+		queue_push(&ctx_row);
+		return;
+	}
+	if (ctx_row.artist_uri[0] && opt == n++) {
+		open_library_view(NATIVE_ARTIST, ctx_row.artist_uri, ctx_row.sub);
+		return;
+	}
+	if (ctx_row.album_uri[0] && opt == n++)
+		open_library_view(NATIVE_ALBUM, ctx_row.album_uri, tr(S_ALBUM));
+}
+
+static void draw_ctx_menu(const Skin *sk)
+{
+	const u32 scrim  = C2D_Color32(0x00, 0x00, 0x00, 0x98);
+	const u32 bord   = C2D_Color32(0x38, 0x38, 0x38, 0xFF);
+	const u32 panel  = C2D_Color32(0x1B, 0x1B, 0x1B, 0xFF);
+	const u32 hilite = C2D_Color32(0x24, 0x24, 0x24, 0xFF);
+
+	C2D_DrawRectSolid(0.0f, 0.0f, 0.6f, BOT_W, SCR_H, scrim);
+
+	const int n = ctx_option_count();
+	const float ph = 40.0f + (float)n * CTX_ROW_H;
+	const float px = (BOT_W - CTX_W) / 2.0f;
+	const float py = (SCR_H - ph) / 2.0f;
+	round_panel(px, py, CTX_W, ph, CTX_R, bord, panel);
+
+	/* The touch map answers the first rect holding the point: options are
+	 * registered before the full-screen closer so they win inside the
+	 * card, and a tap on the scrim falls through to CTX_CLOSE. */
+	ui_depth(0.7f);
+	float y = py + 10.0f;
+	ui_text(text_buf, ctx_row.label, px + 12.0f,
+	        ui_baseline(y, TY_ROW_NAME), TY_ROW_NAME, CTX_W - 24.0f, sk->text);
+	y += 28.0f;
+
+	static const str_id opt_str[3] = { S_PLAY_NEXT, S_GO_ARTIST, S_GO_ALBUM };
+	const bool avail[3] = { true, ctx_row.artist_uri[0] != '\0',
+	                        ctx_row.album_uri[0] != '\0' };
+	for (int i = 0, opt = 0; i < 3; i++) {
+		if (!avail[i])
+			continue;
+		const float top = y + (float)opt * CTX_ROW_H;
+		if (g_touch.down && g_touch.press_id == CTX_ROW0 + opt)
+			rounded_rect(px + 4.0f, top + 1.0f, CTX_W - 8.0f,
+			             CTX_ROW_H - 2.0f, 6.0f, hilite);
+		ui_text(text_buf, tr(opt_str[i]), px + 14.0f,
+		        ui_baseline(top + CTX_ROW_H / 2.0f, TY_ROW_NAME), TY_ROW_NAME,
+		        CTX_W - 28.0f, sk->text);
+		tb_add(&g_tb, px + 4.0f, top, CTX_W - 8.0f, CTX_ROW_H, CTX_ROW0 + opt);
+		opt++;
+	}
+	tb_add(&g_tb, 0.0f, 0.0f, BOT_W, SCR_H, CTX_CLOSE);
 	ui_depth(0.0f);
 }
 
@@ -1686,8 +1792,6 @@ static void draw_bottom(const Skin *sk)
 		a.dl_active = native_dl_active(tmp_title, sizeof(tmp_title)) >= 0;
 		a.can_prev = play_idx > 0;
 		a.can_next = play_idx >= 0 && play_idx + 1 < play_count;
-		a.can_artist = native_now_artist_uri()[0] != '\0';
-		a.can_album = native_now_album_uri()[0] != '\0';
 		a.progress_ms = (long)(now_pos * 1000.0f);
 		a.duration_ms = (long)(now_dur * 1000.0f);
 		a.pressed_id = g_touch.down ? g_touch.press_id : -1;
@@ -1719,6 +1823,9 @@ static void draw_bottom(const Skin *sk)
 	} else if (queue_open) {
 		tb_reset(&g_tb);
 		draw_queue(sk);
+	} else if (ctx_open) {
+		tb_reset(&g_tb);
+		draw_ctx_menu(sk);
 	}
 }
 
@@ -2269,6 +2376,19 @@ int main(int argc, char **argv)
 			down = 0;
 			g_touch.clicked = -1;
 			g_touch.long_pressed = -1;
+		} else if (ctx_open) {
+			/* An option runs its action; the scrim (or the usual keys)
+			 * just closes. The touch map holds only the options and
+			 * the full-screen closer, so a plain >= 0 test is safe. */
+			if (g_touch.clicked >= CTX_ROW0 && g_touch.clicked < CTX_ROW0 + 3)
+				ctx_run(g_touch.clicked - CTX_ROW0);
+			if (down & (KEY_B | KEY_START | KEY_SELECT))
+				ctx_open = false;
+			else if (g_touch.clicked >= 0)
+				ctx_open = false;
+			down = 0;
+			g_touch.clicked = -1;
+			g_touch.long_pressed = -1;
 		} else if (down & KEY_SELECT) {
 			help_open = true;
 			down = 0;
@@ -2348,21 +2468,6 @@ int main(int argc, char **argv)
 				native_fetch_cancel();   /* drop the old view's in-flight fetch */
 				lib.scroll = lib.velocity = 0.0f;
 				lib_reload = true;
-				break;
-			case BTN_P_ARTIST:
-				/* From the playing track into its artist: the metadata
-				 * carried the gid, so no lookup stands between the tap
-				 * and the list. */
-				if (native_now_artist_uri()[0])
-					open_library_view(NATIVE_ARTIST,
-					                  native_now_artist_uri(),
-					                  native_now_artist());
-				break;
-			case BTN_P_ALBUM:
-				if (native_now_album_uri()[0])
-					open_library_view(NATIVE_ALBUM,
-					                  native_now_album_uri(),
-					                  native_now_album());
 				break;
 			case BTN_P_LIBRARY:
 				lib.open = true;
@@ -2516,15 +2621,18 @@ int main(int argc, char **argv)
 			else if (g_touch.clicked >= SL_ROW0)
 				activate_row(g_touch.clicked - SL_ROW0);
 
-			/* Holding a row queues it after what is playing; a tap keeps
-			 * meaning "play now". The long press cancels the tap itself,
-			 * so no row plays by accident. */
+			/* Holding a row opens its context menu -- play next, go to
+			 * the artist or the album. A tap keeps meaning "play now";
+			 * the long press cancels the tap itself, so nothing plays
+			 * by accident. */
 			if (g_touch.long_pressed >= SL_ROW0) {
 				int extra = (nat_view == NATIVE_PLAYLISTS) ? 2 : 0;
 				int idx = g_touch.long_pressed - SL_ROW0 - extra;
 				if (idx >= 0 && idx < nat_count &&
-				    !nat_rows[idx].is_playlist)
-					queue_push(&nat_rows[idx]);
+				    !nat_rows[idx].is_playlist) {
+					ctx_row = nat_rows[idx];
+					ctx_open = true;
+				}
 			}
 
 			if (down & KEY_A)

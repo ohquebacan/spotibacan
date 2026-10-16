@@ -1465,6 +1465,10 @@ static int name_tracks(char uris[][64], int n, native_row *rows, int max,
 			snprintf(r->uri, sizeof(r->uri), "%s",
 			         meta[i].uri[0] ? meta[i].uri : uris[base + i]);
 			snprintf(r->art, sizeof(r->art), "%s", meta[i].art_small);
+			snprintf(r->artist_uri, sizeof(r->artist_uri), "%s",
+			         meta[i].artist_uri);
+			snprintf(r->album_uri, sizeof(r->album_uri), "%s",
+			         meta[i].album_uri);
 			r->is_playlist = false;
 		}
 		if (named > done - base)
@@ -1652,6 +1656,10 @@ int native_fetch(native_view view, const char *arg, native_row *rows, int max,
 			snprintf(rows[i].uri, sizeof(rows[i].uri), "%s", briefs[i].uri);
 			snprintf(rows[i].art, sizeof(rows[i].art), "%s",
 			         briefs[i].art_small);
+			snprintf(rows[i].artist_uri, sizeof(rows[i].artist_uri), "%s",
+			         briefs[i].artist_uri);
+			snprintf(rows[i].album_uri, sizeof(rows[i].album_uri), "%s",
+			         briefs[i].album_uri);
 			rows[i].is_playlist = false;
 		}
 		return n;
