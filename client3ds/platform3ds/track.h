@@ -59,7 +59,17 @@ void track_free(track_audio *t);
  * piece lands, and the decoder must never read past it. */
 #define TRACK_STREAM_MAX (12 * 1024 * 1024)
 
+/* How long a download keeps retrying with nothing arriving before it gives
+ * up on the track. Long enough to walk through a dead spot in the house. */
+#define TRACK_STALL_GIVEUP_MS 90000u
+
 typedef struct {
+	/* Set by the caller before track_stream_begin: a download for the
+	 * card may take the 320 kbps file, streaming always takes 160. */
+	bool     want_hq;
+	/* Optional keep-alive session to the spclient host for metadata and
+	 * storage-resolve (caller-owned, one thread at a time). */
+	struct http_session *sess;
 	uint8_t *data;              /* reserved whole file; NULL until the
 	                             * total is known */
 	size_t   len;               /* the file's full size */
@@ -74,9 +84,17 @@ typedef struct {
 	char     dl_err[160];
 	/* A seek past the watermark writes an absolute byte offset here; the
 	 * download thread aborts the current request and resumes from there,
-	 * leaving a zero hole behind that the decoder never walks back into
-	 * without another seek. -1 = no reposition pending. */
+	 * leaving a zero hole behind (see has_hole). -1 = no reposition
+	 * pending. */
 	volatile long dl_restart_at;
+	/* The span a forward seek skipped, [hole_lo, hole_hi): still zero fill
+	 * while has_hole. The decoder must not walk into it, and the file is
+	 * not done (nor saved) until a fill pass has closed it. hole_lo moves
+	 * up as bytes land on it. Download thread writes, decoder reads. */
+	volatile bool   has_hole;
+	volatile size_t hole_lo, hole_hi;
+	bool            filling;     /* closing the hole after the tail landed:
+	                              * `downloaded` stays at the tail meanwhile */
 
 	sp_track   meta;
 	int        format;

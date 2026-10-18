@@ -42,6 +42,10 @@ typedef struct {
 	 * images. */
 	char    art_small[80];
 	char    art_large[80];
+	/* spotify:album:... and spotify:artist:... (first artist), built from
+	 * the gids, for "go to album / artist". Empty when absent. */
+	char    album_uri[40];
+	char    artist_uri[40];
 	int     duration_ms;
 	sp_file files[SP_MAX_FILES];
 	int     file_count;
@@ -54,6 +58,10 @@ int  sp_resolve(char *host, size_t hostlen, char *err, size_t errlen);
 /* One track's metadata, via the extended-metadata batch service. */
 int  sp_track_metadata(const char *host, const char *token, const char *track_uri,
                        sp_track *out, char *err, size_t errlen);
+/* The same over a caller-owned keep-alive session (NULL = fresh connection). */
+int  sp_track_metadata_s(http_session *sess, const char *host, const char *token,
+                         const char *track_uri, sp_track *out, char *err,
+                         size_t errlen);
 
 /* Several at once. The service takes a repeated entity_request, so a screenful
  * of tracks costs one round trip instead of one each -- which on this console
@@ -126,9 +134,47 @@ typedef struct {
 int  sp_storage_resolve(const char *host, const char *token,
                         const uint8_t file_id[20], sp_storage *out,
                         char *err, size_t errlen);
+/* An artist's albums and singles, newest Spotify order, for the artist
+ * view. type is 1 for an album, 2 for a single/EP. */
+typedef struct {
+	char uri[40];
+	char name[64];
+	char art[80];       /* 64px cover, "" when none */
+	int  year;          /* 0 when unknown */
+	int  type;
+} sp_release;
+
+int  sp_artist_releases(http_session *sess, const char *host, const char *token,
+                        const char *artist_uri, sp_release *out, int max,
+                        char *err, size_t errlen);
+
+/* The tracks of any context the context service knows: an album, or an
+ * artist (its top tracks). Returns the count, or -1 with err set. */
+/* Appends a track to a playlist the account may edit, through the same
+ * playlist service the official clients use (ListChanges on the current
+ * revision). 0 on success; err says why not (e.g. "not your playlist"). */
+int  sp_playlist_add(const char *host, const char *token,
+                     const char *playlist_uri, const char *track_uri,
+                     char *err, size_t errlen);
+
+int  sp_context_tracks(const char *host, const char *token, const char *uri,
+                       char uris[][64], int max, char *err, size_t errlen);
+
+int  sp_storage_resolve_s(http_session *sess, const char *host,
+                          const char *token, const uint8_t file_id[20],
+                          sp_storage *out, char *err, size_t errlen);
 
 /* Picks the best file this client can actually play, or NULL. */
 const sp_file *sp_pick_file(const sp_track *t);
+
+/* Opt-in 320 kbps (Settings). Only taken when the whole file fits the
+ * stream buffer (SP_HQ_MAX_BYTES, kept equal to TRACK_STREAM_MAX): a long
+ * track quietly falls back to 160 rather than failing. */
+#define SP_HQ_MAX_BYTES (12u * 1024u * 1024u)
+void sp_set_high_quality(bool on);
+/* sp_pick_file with an explicit choice; sp_pick_file follows the setting. */
+const sp_file *sp_pick_file_q(const sp_track *t, bool hq);
+bool sp_high_quality(void);
 const char *sp_format_name(int format);
 
 /* The user's profile image URL, from the Web API's /v1/me (the one service

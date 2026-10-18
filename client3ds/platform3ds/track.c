@@ -143,20 +143,25 @@ int track_stream_begin(const char *sp_host, const char *token, ap_session *ap,
                        const char *track_uri, void (*progress)(const char *),
                        track_stream *out, char *err, size_t errlen)
 {
+	/* The fields set by the caller survive the reset. */
+	const bool want_hq = out->want_hq;
+	struct http_session *sess = out->sess;
 	memset(out, 0, sizeof(*out));
+	out->want_hq = want_hq;
+	out->sess = sess;
 	out->dl_restart_at = -1;
 
 	/* The same three steps as track_fetch, in the same order: the key must
 	 * be asked for before the bytes are worth fetching. */
 	if (progress) progress("metadata");
-	if (sp_track_metadata(sp_host, token, track_uri, &out->meta,
-	                      err, errlen) != 0)
+	if (sp_track_metadata_s(out->sess, sp_host, token, track_uri, &out->meta,
+	                        err, errlen) != 0)
 		return -1;
 	if (!out->meta.has_gid) {
 		snprintf(err, errlen, "metadata carried no track id");
 		return -1;
 	}
-	const sp_file *file = sp_pick_file(&out->meta);
+	const sp_file *file = sp_pick_file_q(&out->meta, out->want_hq);
 	if (!file) {
 		snprintf(err, errlen, "no Vorbis file this console can play");
 		return -1;
@@ -164,8 +169,8 @@ int track_stream_begin(const char *sp_host, const char *token, ap_session *ap,
 	out->format = file->format;
 
 	if (progress) progress("storage-resolve");
-	if (sp_storage_resolve(sp_host, token, file->id, &out->storage,
-	                       err, errlen) < 0)
+	if (sp_storage_resolve_s(out->sess, sp_host, token, file->id,
+	                         &out->storage, err, errlen) < 0)
 		return -1;
 
 	if (progress) progress("clave de audio");
@@ -213,8 +218,25 @@ static bool stream_cb(void *ctx, const char *data, size_t n)
 		ts->cb_fatal = true;
 		return false;
 	}
+	const size_t start = ts->write_pos;
 	ts->write_pos += n;
+	/* Bytes landing on the hole's low edge shrink it. */
+	if (ts->has_hole && start <= ts->hole_lo && ts->write_pos > ts->hole_lo) {
+		ts->hole_lo = ts->write_pos;
+		__sync_synchronize();
+		if (ts->hole_lo >= ts->hole_hi)
+			ts->has_hole = false;
+	}
 	__sync_synchronize();
+	if (ts->filling) {
+		if (!ts->has_hole) {
+			/* Closed: the tail beyond it is already here. */
+			ts->filling = false;
+			ts->write_pos = ts->len;
+			return false;
+		}
+		return true;   /* the tail is the watermark until then */
+	}
 	ts->downloaded = ts->write_pos;
 	return true;
 }
@@ -223,11 +245,8 @@ static bool stream_cb(void *ctx, const char *data, size_t n)
  * CTR mode is a keystream: the counter for byte N is the IV plus N/16 as a
  * 128-bit big-endian integer, so any offset is reachable without decrypting
  * what came before. */
-static void stream_rewind(track_stream *ts, size_t at)
+static void stream_keystream_at(track_stream *ts, size_t at)
 {
-	at &= ~(size_t)15;
-	if (ts->len && at >= ts->len)
-		at = ts->len & ~(size_t)15;
 	memcpy(ts->nonce, AUDIO_AESIV, sizeof(ts->nonce));
 	uint64_t add = at / 16;
 	for (int i = 15; i >= 0 && add; i--) {
@@ -237,8 +256,40 @@ static void stream_rewind(track_stream *ts, size_t at)
 	}
 	ts->nc_off = 0;
 	ts->write_pos = at;
+}
+
+/* A seek moving the download. Jumping forward leaves [write_pos, at) as
+ * zero fill: that is recorded as the hole (merged with any earlier one,
+ * conservatively) so the decoder cannot run into it and the file is not
+ * saved with it. Jumping into the hole leaves only [hole_lo, at) owing. */
+static void stream_rewind(track_stream *ts, size_t at)
+{
+	at &= ~(size_t)15;
+	if (ts->len && at >= ts->len)
+		at = ts->len & ~(size_t)15;
+	ts->filling = false;
+	if (at > ts->write_pos) {
+		size_t lo = ts->write_pos;
+		if (ts->has_hole && ts->hole_lo < lo)
+			lo = ts->hole_lo;
+		ts->hole_lo = lo;
+		ts->hole_hi = at;
+		__sync_synchronize();
+		ts->has_hole = true;
+	} else if (ts->has_hole && at > ts->hole_lo && at < ts->hole_hi) {
+		ts->hole_hi = at;
+	}
+	stream_keystream_at(ts, at);
 	__sync_synchronize();
 	ts->downloaded = at;
+}
+
+/* The tail reached the end with a hole still open: go back and fill it,
+ * leaving the published watermark at the tail for the decoder. */
+static void stream_fill_hole(track_stream *ts)
+{
+	ts->filling = true;
+	stream_keystream_at(ts, ts->hole_lo & ~(size_t)15);
 }
 
 int track_stream_download(track_stream *ts, volatile bool *stop)
@@ -256,29 +307,61 @@ int track_stream_download(track_stream *ts, volatile bool *stop)
 	ts->nc_off = 0;
 	ts->aes = &aes;
 
-	/* Two passes over the URL list: a Wi-Fi blip at 90% should not cost
-	 * the track, and every attempt resumes where the last one stopped. A
-	 * reposition earns two fresh passes from the new offset. */
-	for (int pass = 0; pass < 2 && !ts->dl_done && !ts->cb_fatal; pass++) {
+	/* Keep at it while the link comes and goes: walking through a dead spot
+	 * used to burn the two passes in seconds and end the song mid-play.
+	 * Every attempt resumes where the last one stopped; the clock only runs
+	 * while nothing arrives, and any progress resets it. A reposition
+	 * starts the clock afresh from the new offset. */
+	u64 stalled_since = 0;
+	unsigned backoff_ms = 500;
+	while (!ts->dl_done && !ts->cb_fatal && !(stop && *stop)) {
 		if (ts->dl_restart_at >= 0) {
 			size_t at = (size_t)ts->dl_restart_at;
 			ts->dl_restart_at = -1;
 			stream_rewind(ts, at);
-			pass = -1;
-			continue;
+			stalled_since = 0;
+			backoff_ms = 500;
 		}
+		const size_t before = ts->write_pos;
 		for (int i = 0; i < ts->storage.count; i++) {
 			if ((stop && *stop) || ts->cb_fatal || ts->dl_restart_at >= 0)
 				break;
 			int status = 0;
+			ts->dl_err[0] = '\0';   /* this try's reason, not an old one */
 			http_get_url_stream(ts->storage.urls[i], ts->write_pos,
 			                    stream_cb, ts, &ts->total, &status,
 			                    ts->dl_err, sizeof(ts->dl_err));
-			if (ts->len && ts->write_pos >= ts->len)
-				ts->dl_done = true;
+			if (ts->len && ts->write_pos >= ts->len) {
+				if (!ts->has_hole) {
+					ts->dl_done = true;
+				} else if (!ts->filling) {
+					stream_fill_hole(ts);
+					i--;   /* same url, from the hole */
+					continue;
+				}
+			}
 			if (ts->dl_done || (stop && *stop))
 				break;
 		}
+		if (ts->dl_done || ts->cb_fatal || (stop && *stop) ||
+		    ts->dl_restart_at >= 0)
+			continue;
+		const u64 now = osGetTime();
+		if (ts->write_pos > before) {
+			stalled_since = 0;   /* it moved: the link is back */
+			backoff_ms = 500;
+		} else if (!stalled_since) {
+			stalled_since = now;
+		} else if (now - stalled_since > TRACK_STALL_GIVEUP_MS) {
+			break;   /* a minute and a half of nothing: really gone */
+		}
+		/* Let the Wi-Fi reassociate before the next try, checking for a
+		 * stop or a seek every 100 ms. */
+		for (unsigned w = 0; w < backoff_ms && !(stop && *stop) &&
+		                     ts->dl_restart_at < 0; w += 100)
+			svcSleepThread(100000000LL);
+		if (backoff_ms < 4000)
+			backoff_ms *= 2;
 	}
 	ts->aes = NULL;
 	mbedtls_aes_free(&aes);

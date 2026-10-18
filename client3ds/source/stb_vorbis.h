@@ -24,6 +24,11 @@ typedef struct {
 
 stb_vorbis *stb_vorbis_open_memory(const unsigned char *data, int len,
                                    int *error, const stb_vorbis_alloc *alloc);
+/* Pulls from an open file as it decodes; `close_handle_on_close` hands the
+ * FILE to the decoder, which closes it even when the open fails. */
+#include <stdio.h>
+stb_vorbis *stb_vorbis_open_file(FILE *f, int close_handle_on_close,
+                                 int *error, const stb_vorbis_alloc *alloc);
 void stb_vorbis_close(stb_vorbis *f);
 void stb_vorbis_seek_start(stb_vorbis *f);
 /* Sample-accurate seek; the streaming decoder checks the resulting file

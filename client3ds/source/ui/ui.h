@@ -76,6 +76,12 @@ void ui_text_tracked(C2D_TextBuf buf, const char *s, float x, float y,
 /* Width the string would occupy, for right-aligning and centring. */
 float ui_text_width(C2D_TextBuf buf, const char *s, type_role r);
 
+/* Trims s in place (on a codepoint boundary, ending in "..") until it fits
+ * maxw at a raw citro2d scale. Measures on a private buffer, so it costs
+ * the frame's text arena nothing. */
+void ui_fit_scaled(C2D_TextBuf fallback, char *s, size_t cap, float sc,
+                   float maxw);
+
 /* Depth for the ui_* primitives (text, discs, polylines). They all draw at
  * z=0 by default; a band painted over scrolling content (the list header)
  * needs to sit above the images that content draws at z=0.1. Reset to 0

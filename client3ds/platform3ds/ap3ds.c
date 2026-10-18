@@ -3,6 +3,7 @@
 #include "http3ds.h"
 #include "proto3ds.h"
 #include "shannon.h"
+#include "tls3ds.h"
 
 #include <3ds.h>
 #include <errno.h>
@@ -146,7 +147,7 @@ static int tcp_connect(const char *host, uint16_t port, char *err, size_t errlen
 		snprintf(err, errlen, "socket() failed, errno %d", errno);
 		return -1;
 	}
-	if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+	if (tls_connect_timeout(fd, res->ai_addr, res->ai_addrlen, 8000) < 0) {
 		snprintf(err, errlen, "connect() to %s:%u failed, errno %d",
 		         host, port, errno);
 		close(fd);

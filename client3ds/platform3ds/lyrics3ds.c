@@ -110,7 +110,7 @@ lyrics_result lyrics_fetch(const char *track, const char *artist,
                            lyrics_doc *out, char *err, size_t errlen)
 {
 	if (!track || !*track || !artist) {
-		snprintf(err, errlen, "sin pista");
+		snprintf(err, errlen, "no track");
 		return LYR_ERR;
 	}
 
@@ -138,7 +138,7 @@ lyrics_result lyrics_fetch(const char *track, const char *artist,
 		return LYR_NONE;
 	}
 	if (r.status != 200) {
-		snprintf(err, errlen, "lrclib devolvio HTTP %d", r.status);
+		snprintf(err, errlen, "lrclib returned HTTP %d", r.status);
 		http_reply_free(&r);
 		return LYR_ERR;
 	}

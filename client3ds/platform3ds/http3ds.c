@@ -124,7 +124,9 @@ static size_t dechunk(char *p, size_t len)
 			break;
 		unsigned long size = strtoul(in, NULL, 16);
 		in = nl + 1;
-		if (size == 0 || in + size > end)
+		/* Compare lengths, not pointers: a huge size wraps in + size on a
+		 * 32-bit address space and slips past an end-pointer check. */
+		if (size == 0 || size > (unsigned long)(end - in))
 			break;
 		memmove(out, in, size);
 		out += size;
@@ -442,31 +444,45 @@ int http_get_url_stream(const char *url, size_t offset,
 	/* Body: first the piece the header reads overshot, then straight reads. */
 	const char *body = sep + 4;
 	size_t blen = have - (size_t)(body - hbuf);
+	/* The callback may have said why it stopped; keep that. */
 	if (blen && !cb(ctx, body, blen)) {
-		snprintf(err, errlen, "cancelled");
+		if (!err[0])
+			snprintf(err, errlen, "cancelled");
 		tls_close(c);
 		return -1;
 	}
-	char piece[RECV_CHUNK];
+	/* A whole TLS record per read on the long CDN body: a quarter of the
+	 * calls (and callbacks) of RECV_CHUNK pieces. Heap, not stack: this
+	 * runs on worker threads with modest stacks. */
+	enum { STREAM_PIECE = 16 * 1024 };
+	char *piece = malloc(STREAM_PIECE);
+	if (!piece) {
+		snprintf(err, errlen, "out of memory");
+		tls_close(c);
+		return -1;
+	}
+	int rc = 0;
 	for (;;) {
-		int r = tls_read(c, piece, sizeof(piece));
+		int r = tls_read(c, piece, STREAM_PIECE);
 		if (r == 0)
 			break;
 		if (r < 0) {
 			char reason[128];
 			tls_strerror(r, reason, sizeof(reason));
 			snprintf(err, errlen, "read: %s", reason);
-			tls_close(c);
-			return -1;
+			rc = -1;
+			break;
 		}
 		if (!cb(ctx, piece, (size_t)r)) {
-			snprintf(err, errlen, "cancelled");
-			tls_close(c);
-			return -1;
+			if (!err[0])
+				snprintf(err, errlen, "cancelled");
+			rc = -1;
+			break;
 		}
 	}
+	free(piece);
 	tls_close(c);
-	return 0;
+	return rc;
 }
 
 /* ---------------- keep-alive sessions ---------------- */
@@ -477,6 +493,8 @@ struct http_session {
 	char      carry[RECV_CHUNK];
 	size_t    carry_len;
 	int       reused_last;   /* the last request rode an open connection */
+	unsigned  wait_ms;       /* request sent -> status line (server time) */
+	unsigned  body_ms;       /* status line -> body complete (wire + CPU) */
 };
 
 http_session *http_session_open(const char *host)
@@ -554,6 +572,12 @@ static int sess_exact(http_session *s, char *dst, size_t n)
 static int sess_grow(char **buf, size_t *cap, size_t have, size_t extra,
                      size_t limit, char *err, size_t errlen)
 {
+	/* Sizes come off the wire (Content-Length, chunk sizes): reject before
+	 * any addition can wrap a 32-bit size_t into a value that passes. */
+	if (have >= limit || extra >= limit - have) {
+		snprintf(err, errlen, "response over %u bytes", (unsigned)limit);
+		return -1;
+	}
 	if (have + extra + 1 <= *cap)
 		return 0;
 	size_t want = *cap ? *cap : 8192;
@@ -628,6 +652,7 @@ static int sess_attempt(http_session *s, const char *path, const char *method,
 	}
 
 	char line[512];
+	const u64 t_sent = osGetTime();
 	if (sess_line(s, line, sizeof(line)) != 0) {
 		snprintf(out->err, sizeof(out->err), "connection dropped idle");
 		*stale = true;
@@ -661,6 +686,8 @@ static int sess_attempt(http_session *s, const char *path, const char *method,
 		}
 	}
 
+	const u64 t_head = osGetTime();
+	s->wait_ms = (unsigned)(t_head - t_sent);
 	char *buf = NULL;
 	size_t cap = 0, have = 0;
 	if (chunked) {
@@ -729,6 +756,7 @@ static int sess_attempt(http_session *s, const char *path, const char *method,
 	buf[have] = '\0';
 	out->body = buf;
 	out->len = have;
+	s->body_ms = (unsigned)(osGetTime() - t_head);
 	if (conn_close) {
 		tls_close(s->c);
 		s->c = NULL;
@@ -773,4 +801,11 @@ int http_session_request(http_session *s, const char *path, const char *method,
 int http_session_last_reused(const http_session *s)
 {
 	return s ? s->reused_last : 0;
+}
+
+void http_session_last_timing(const http_session *s, unsigned *wait_ms,
+                              unsigned *body_ms)
+{
+	*wait_ms = s ? s->wait_ms : 0;
+	*body_ms = s ? s->body_ms : 0;
 }

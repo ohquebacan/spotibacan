@@ -13,6 +13,8 @@
  * EntityRequest { entity_uri 1, query 2 }, ExtensionQuery { extension_kind 1 }.
  * Putting the entity request in field 1 yields HTTP 200 and an empty body,
  * which is a confusing way to be told the shape is wrong. */
+#define EXT_KIND_ARTIST_V4 8
+#define EXT_KIND_ALBUM_V4  9
 #define EXT_KIND_TRACK_V4 10
 
 /* Defined with the playlist code below; the rootlist is the same shape and
@@ -74,7 +76,10 @@ static void read_cover_urls(const pbv *track, sp_track *out)
 		read_image_ids(&album, 9, ids);
 
 	const char *small = ids[1][0] ? ids[1] : ids[2][0] ? ids[2] : ids[0];
-	const char *large = ids[2][0] ? ids[2] : ids[0][0] ? ids[0] : ids[1];
+	/* The "large" cover is drawn at 128px at most, so the 300px image
+	 * (size 0) is plenty: the 640px one is ~4x the bytes to fetch over TLS
+	 * and the pixels to decode, and cost 3-8 s per saved song. */
+	const char *large = ids[0][0] ? ids[0] : ids[2][0] ? ids[2] : ids[1];
 	if (small[0])
 		snprintf(out->art_small, sizeof(out->art_small),
 		         "https://i.scdn.co/image/%s", small);
@@ -96,8 +101,25 @@ const char *sp_format_name(int format)
 	}
 }
 
+static volatile bool s_high_quality;
+
+void sp_set_high_quality(bool on) { s_high_quality = on; }
+bool sp_high_quality(void) { return s_high_quality; }
+
 const sp_file *sp_pick_file(const sp_track *t)
 {
+	return sp_pick_file_q(t, s_high_quality);
+}
+
+const sp_file *sp_pick_file_q(const sp_track *t, bool hq)
+{
+	/* 320 when asked for and the file fits the buffer: about 40 KB a
+	 * second, plus headroom for Vorbis running over its nominal rate. */
+	if (hq && t->duration_ms > 0 &&
+	    (uint64_t)t->duration_ms * 40 * 11 / 10 + 65536 < SP_HQ_MAX_BYTES)
+		for (int i = 0; i < t->file_count; i++)
+			if (t->files[i].format == SP_FMT_OGG_320)
+				return &t->files[i];
 	/* 160 first, then 96, then 320: the order of what this console should
 	 * actually stream and decode, not of audio quality. */
 	static const int WANT[] = { SP_FMT_OGG_160, SP_FMT_OGG_96, SP_FMT_OGG_320 };
@@ -140,10 +162,54 @@ int sp_resolve(char *host, size_t hostlen, char *err, size_t errlen)
 	return 0;
 }
 
+/* One request over the caller's keep-alive session when it has one, else
+ * over a fresh connection. A fresh TLS handshake costs the ARM11 a second
+ * or two; the player pays it for nothing on every track otherwise. */
+static int sp_req(http_session *sess, const char *host, const char *path,
+                  const char *method, const char *token, const char *ctype,
+                  const void *body, size_t len, http_reply *r)
+{
+	if (sess)
+		return http_session_request(sess, path, method, token, ctype,
+		                            "application/x-protobuf", body, len, 0, r);
+	return http_request(host, path, method, token, ctype,
+	                    "application/x-protobuf", body, len, 0, r);
+}
+
+/* A 16-byte gid as the 22-character base62 id Spotify URIs carry: the gid
+ * is one big-endian 128-bit number, written most significant digit first. */
+static void gid_to_uri(const char *kind, const uint8_t *gid, char *out,
+                       size_t outlen)
+{
+	static const char B62[] =
+	    "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+	uint8_t num[16];
+	memcpy(num, gid, 16);
+	char digits[22];
+	for (int d = 21; d >= 0; d--) {
+		unsigned rem = 0;
+		for (int i = 0; i < 16; i++) {   /* num /= 62, keep the remainder */
+			unsigned cur = (rem << 8) | num[i];
+			num[i] = (uint8_t)(cur / 62);
+			rem = cur % 62;
+		}
+		digits[d] = B62[rem];
+	}
+	snprintf(out, outlen, "spotify:%s:%.22s", kind, digits);
+}
+
 int sp_track_metadata(const char *host, const char *token, const char *track_uri,
                       sp_track *out, char *err, size_t errlen)
 {
+	return sp_track_metadata_s(NULL, host, token, track_uri, out, err, errlen);
+}
+
+int sp_track_metadata_s(http_session *sess, const char *host, const char *token,
+                        const char *track_uri, sp_track *out, char *err,
+                        size_t errlen)
+{
 	memset(out, 0, sizeof(*out));
+	snprintf(out->uri, sizeof(out->uri), "%s", track_uri);
 
 	uint8_t q_store[16], er_store[256], req_store[320];
 	pb q, er, req;
@@ -163,9 +229,8 @@ int sp_track_metadata(const char *host, const char *token, const char *track_uri
 	/* The Bearer matters here as much as on the GETs: without it the service
 	 * answers 200 with an empty body rather than 401, which reads like a
 	 * malformed request. */
-	if (http_request(host, "/extended-metadata/v0/extended-metadata", "POST",
-	                 token, "application/x-protobuf", "application/x-protobuf",
-	                 req.p, req.len, 0, &r) != 0) {
+	if (sp_req(sess, host, "/extended-metadata/v0/extended-metadata", "POST",
+	           token, "application/x-protobuf", req.p, req.len, &r) != 0) {
 		snprintf(err, errlen, "metadata: %s", r.err);
 		return -1;
 	}
@@ -207,6 +272,8 @@ int sp_track_metadata(const char *host, const char *token, const char *track_uri
 		pbv an;
 		if (pb_get_bytes(v.p, v.len, 2, &an))         /* Album.name */
 			copy_str(out->album, sizeof(out->album), &an);
+		if (pb_get_bytes(v.p, v.len, 1, &an) && an.len == 16)   /* gid */
+			gid_to_uri("album", an.p, out->album_uri, sizeof(out->album_uri));
 	}
 	read_cover_urls(&track, out);
 	if (pb_get_bytes(track.p, track.len, 4, &v)) {    /* first Artist */
@@ -215,6 +282,9 @@ int sp_track_metadata(const char *host, const char *token, const char *track_uri
 		 * field here would hand back raw bytes that are not text. */
 		if (pb_get_bytes(v.p, v.len, 2, &an))
 			copy_str(out->artist, sizeof(out->artist), &an);
+		if (pb_get_bytes(v.p, v.len, 1, &an) && an.len == 16)
+			gid_to_uri("artist", an.p, out->artist_uri,
+			           sizeof(out->artist_uri));
 	}
 
 	/* Track.file is repeated, and pb_get_bytes only yields the first, so the
@@ -392,6 +462,129 @@ int sp_playlist(const char *host, const char *token, const char *playlist_id,
 	pbv whole = { body, r.len };
 	int n = read_list_items(&whole, uris, max);
 	http_reply_free(&r);
+
+	/* The service may hand back only the head of a long list (length says
+	 * how many there are): ask for the rest a window at a time. A reply
+	 * whose ListItems.pos is not where we asked means `from` was ignored,
+	 * and its rows would only repeat the head. */
+	int pages = 0;
+	while (n < (int)length && n < max && pages++ < 20) {
+		int want = max - n < 100 ? max - n : 100;
+		snprintf(path, sizeof(path),
+		         "/playlist/v2/playlist/%s?from=%d&length=%d",
+		         playlist_id, n, want);
+		if (http_get_proto(host, path, token, &r) != 0)
+			break;
+		int got = 0;
+		pbv contents;
+		uint64_t pos = 0;
+		if (r.status == 200 &&
+		    pb_get_bytes((const uint8_t *)r.body, r.len, 5, &contents) &&
+		    pb_get_varint(contents.p, contents.len, 1, &pos) &&
+		    pos == (uint64_t)n) {
+			pbv page = { (const uint8_t *)r.body, r.len };
+			got = read_list_items(&page, uris + n, max - n);
+		}
+		http_reply_free(&r);
+		if (got <= 0)
+			break;
+		n += got;
+	}
+	return n;
+}
+
+/* ------------------------------------------------------- context-resolve */
+
+/* The uri out of one tracks[] entry. Liked entries carry a metadata object
+ * that grows with the album title and can pass any fixed buffer, so the
+ * entry is not copied whole: "uri" comes first, and a prefix finds it. A
+ * whole-entry copy that skipped big entries is what dropped liked songs. */
+static bool entry_uri(const char *obj, size_t len, char out[64])
+{
+	char buf[1024];
+	size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
+	memcpy(buf, obj, n);
+	buf[n] = '\0';
+	return json_str(buf, "uri", out, 64);
+}
+
+/* Appends the uris of one page's "tracks" array after the n already held. */
+static int page_tracks(const char *page, char uris[][64], int n, int max,
+                       bool tracks_only)
+{
+	size_t cursor = 0;
+	const char *obj;
+	size_t objlen;
+	while (n < max && json_array_next(page, "tracks", &cursor, &obj, &objlen)) {
+		char u[64];
+		if (!entry_uri(obj, objlen, u))
+			continue;
+		if (tracks_only && strncmp(u, "spotify:track:", 14) != 0)
+			continue;
+		snprintf(uris[n++], 64, "%s", u);
+	}
+	return n;
+}
+
+/* Follows a page link: hm://<path> is served by spclient at /<path>. The
+ * reply is one page; its own next_page_url, if any, goes back in `link`. */
+static int fetch_page(const char *host, const char *token, char *link,
+                      size_t linklen, char uris[][64], int n, int max,
+                      bool tracks_only)
+{
+	const char *path = strncmp(link, "hm://", 5) == 0 ? link + 4 : link;
+	if (*path != '/') {
+		link[0] = '\0';
+		return n;
+	}
+	http_reply r;
+	if (http_get(host, path, token, &r) != 0) {
+		link[0] = '\0';
+		return n;
+	}
+	if (r.status == 200) {
+		n = page_tracks(r.body, uris, n, max, tracks_only);
+		if (!json_str(r.body, "next_page_url", link, linklen))
+			link[0] = '\0';
+	} else {
+		link[0] = '\0';
+	}
+	http_reply_free(&r);
+	return n;
+}
+
+/* context-resolve answers {"pages":[...]}: the first pages inline, later
+ * ones often only as a "page_url" (a long liked list, an album's second
+ * disc), and any page may end in a "next_page_url". Reading just the first
+ * "tracks" array is what cut those lists short; this walks every page and
+ * fetches the linked ones. */
+static int context_pages(const char *host, const char *token,
+                         const char *body, char uris[][64], int max,
+                         bool tracks_only)
+{
+	int n = 0;
+	int hops = 0;
+	size_t cursor = 0;
+	const char *obj;
+	size_t objlen;
+	while (n < max && json_array_next(body, "pages", &cursor, &obj, &objlen)) {
+		char *page = malloc(objlen + 1);
+		if (!page)
+			break;
+		memcpy(page, obj, objlen);
+		page[objlen] = '\0';
+		char link[256] = "";
+		if (strstr(page, "\"tracks\""))
+			n = page_tracks(page, uris, n, max, tracks_only);
+		else
+			json_str(page, "page_url", link, sizeof(link));
+		if (!link[0])
+			json_str(page, "next_page_url", link, sizeof(link));
+		free(page);
+		while (link[0] && n < max && hops++ < 40)
+			n = fetch_page(host, token, link, sizeof(link), uris, n, max,
+			               tracks_only);
+	}
 	return n;
 }
 
@@ -413,23 +606,8 @@ int sp_liked(const char *host, const char *token, const char *username,
 		return -1;
 	}
 
-	/* {"pages":[{"tracks":[{"uri":"spotify:track:...", "metadata":{...}}, ...]}]}
-	 * The array iterator finds "tracks" wherever it sits, which saves walking
-	 * into "pages" first. */
-	int n = 0;
-	size_t cursor = 0;
-	const char *obj;
-	size_t objlen;
-	while (n < max && json_array_next(r.body, "tracks", &cursor, &obj, &objlen)) {
-		char buf[512];
-		if (objlen >= sizeof(buf))
-			continue;
-		memcpy(buf, obj, objlen);
-		buf[objlen] = '\0';
-		char uri[64];
-		if (json_str(buf, "uri", uri, sizeof(uri)))
-			snprintf(uris[n++], 64, "%s", uri);
-	}
+	/* {"pages":[{"tracks":[{"uri":"spotify:track:...", "metadata":{...}}, ...]}]} */
+	int n = context_pages(host, token, r.body, uris, max, false);
 	http_reply_free(&r);
 	return n;
 }
@@ -534,12 +712,18 @@ static int metadata_batch_request(const char *host, http_session *sess,
 					pbv an;
 					if (pb_get_bytes(v.p, v.len, 2, &an))
 						copy_str(out[filled].album, sizeof(out[filled].album), &an);
+					if (pb_get_bytes(v.p, v.len, 1, &an) && an.len == 16)
+						gid_to_uri("album", an.p, out[filled].album_uri,
+						           sizeof(out[filled].album_uri));
 				}
 				read_cover_urls(&track, &out[filled]);
 				if (pb_get_bytes(track.p, track.len, 4, &v)) {
 					pbv an;
 					if (pb_get_bytes(v.p, v.len, 2, &an))
 						copy_str(out[filled].artist, sizeof(out[filled].artist), &an);
+					if (pb_get_bytes(v.p, v.len, 1, &an) && an.len == 16)
+						gid_to_uri("artist", an.p, out[filled].artist_uri,
+						           sizeof(out[filled].artist_uri));
 				}
 				size_t fat = 0;
 				while (fat < track.len && out[filled].file_count < SP_MAX_FILES) {
@@ -587,17 +771,29 @@ int sp_search_tracks(const char *host, const char *token, const char *query,
                      char uris[][64], int max, char *err, size_t errlen)
 {
 	/* The context service takes the query inside the uri itself, with spaces
-	 * as '+'. Everything else still has to be percent-encoded, since this all
-	 * travels in a request line. */
+	 * as '+'. Everything else that is not plain ASCII alphanumerics is
+	 * percent-encoded: this travels in a request line, and "Snødronningen"
+	 * or "Bæ bæ" sent raw is UTF-8 the edge may refuse. A literal ':' or
+	 * '+' in the query must not read as uri structure either. */
+	static const char hexd[] = "0123456789ABCDEF";
 	char plus[192];
 	size_t n = 0;
-	for (const char *p = query; *p && n < sizeof(plus) - 1; p++)
-		plus[n++] = (*p == ' ') ? '+' : *p;
+	for (const unsigned char *p = (const unsigned char *)query;
+	     *p && n + 4 < sizeof(plus); p++) {
+		if (*p == ' ')
+			plus[n++] = '+';
+		else if ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'z') ||
+		         (*p >= 'A' && *p <= 'Z') || *p == '-' || *p == '_' ||
+		         *p == '.' || *p == '~')
+			plus[n++] = (char)*p;
+		else {
+			plus[n++] = '%';
+			plus[n++] = hexd[*p >> 4];
+			plus[n++] = hexd[*p & 15];
+		}
+	}
 	plus[n] = '\0';
 
-	/* No percent-encoding here: '+' and ':' are structural in this uri, and a
-	 * query with anything stranger than letters, digits and spaces is not
-	 * something this console's keyboard is going to produce. */
 	char path[320];
 	snprintf(path, sizeof(path), "/context-resolve/v1/spotify:search:%s", plus);
 
@@ -627,6 +823,275 @@ int sp_search_tracks(const char *host, const char *token, const char *query,
 	http_reply_free(&r);
 	if (count == 0)
 		snprintf(err, errlen, "no tracks matched");
+	return count;
+}
+
+/* One extended-metadata round trip for n entities of one extension kind;
+ * the caller parses r (and frees it) on success. */
+static int ext_request(http_session *sess, const char *host, const char *token,
+                       int kind, const char *const *uris, int n,
+                       http_reply *r, char *err, size_t errlen)
+{
+	uint8_t q_store[16];
+	pb q;
+	pb_init(&q, q_store, sizeof(q_store));
+	pb_varint(&q, 1, (uint64_t)kind);
+	size_t cap = (size_t)n * 128 + 64;
+	uint8_t *req_store = malloc(cap);
+	if (!req_store) {
+		snprintf(err, errlen, "out of memory");
+		return -1;
+	}
+	pb req;
+	pb_init(&req, req_store, cap);
+	for (int i = 0; i < n; i++) {
+		uint8_t er_store[192];
+		pb er;
+		pb_init(&er, er_store, sizeof(er_store));
+		pb_str(&er, 1, uris[i]);
+		pb_sub(&er, 2, &q);
+		pb_sub(&req, 2, &er);
+	}
+	if (!pb_ok(&req)) {
+		free(req_store);
+		snprintf(err, errlen, "metadata request did not fit");
+		return -1;
+	}
+	int rc = sp_req(sess, host, "/extended-metadata/v0/extended-metadata",
+	                "POST", token, "application/x-protobuf", req.p, req.len, r);
+	free(req_store);
+	if (rc != 0) {
+		snprintf(err, errlen, "metadata: %s", r->err);
+		return -1;
+	}
+	if (r->status != 200) {
+		snprintf(err, errlen, "metadata returned HTTP %d", r->status);
+		http_reply_free(r);
+		return -1;
+	}
+	return 0;
+}
+
+/* The message inside the i-th EntityExtensionData, by walking the array. */
+static bool ext_entity(const http_reply *r, int want, pbv *uri, pbv *msg)
+{
+	pbv arr;
+	if (!pb_get_bytes((const uint8_t *)r->body, r->len, 2, &arr))
+		return false;
+	size_t at = 0;
+	for (int i = 0; at < arr.len; i++) {
+		pbv rest = { arr.p + at, arr.len - at };
+		pbv ed, any;
+		if (!pb_get_bytes(rest.p, rest.len, 3, &ed))
+			return false;
+		at = (size_t)(ed.p + ed.len - arr.p);
+		if (i != want)
+			continue;
+		if (!pb_get_bytes(ed.p, ed.len, 2, uri))
+			uri->len = 0;
+		return pb_get_bytes(ed.p, ed.len, 3, &any) &&
+		       pb_get_bytes(any.p, any.len, 2, msg);
+	}
+	return false;
+}
+
+int sp_artist_releases(http_session *sess, const char *host, const char *token,
+                       const char *artist_uri, sp_release *out, int max,
+                       char *err, size_t errlen)
+{
+	http_reply r;
+	const char *one[1] = { artist_uri };
+	if (ext_request(sess, host, token, EXT_KIND_ARTIST_V4, one, 1, &r,
+	                err, errlen) != 0)
+		return -1;
+	pbv uri, artist;
+	if (!ext_entity(&r, 0, &uri, &artist)) {
+		http_reply_free(&r);
+		snprintf(err, errlen, "no artist metadata");
+		return -1;
+	}
+	/* Artist.album_group (5) then single_group (6): each group lists the
+	 * same release once per market, the first one is the one to use. */
+	int n = 0;
+	static const int GROUPS[2] = { 5, 6 };
+	for (int g = 0; g < 2 && n < max; g++) {
+		size_t at = 0;
+		while (at < artist.len && n < max) {
+			pbv rest = { artist.p + at, artist.len - at };
+			pbv grp, alb, gid;
+			if (!pb_get_bytes(rest.p, rest.len, (uint32_t)GROUPS[g], &grp))
+				break;
+			at = (size_t)(grp.p + grp.len - artist.p);
+			if (!pb_get_bytes(grp.p, grp.len, 1, &alb) ||
+			    !pb_get_bytes(alb.p, alb.len, 1, &gid) || gid.len != 16)
+				continue;
+			memset(&out[n], 0, sizeof(out[n]));
+			gid_to_uri("album", gid.p, out[n].uri, sizeof(out[n].uri));
+			out[n].type = g + 1;
+			n++;
+		}
+	}
+	http_reply_free(&r);
+	if (n == 0)
+		return 0;
+
+	/* Names, years and covers: the artist record only carries the ids. */
+	for (int base = 0; base < n; base += 50) {
+		const int chunk = n - base > 50 ? 50 : n - base;
+		const char *uris[50];
+		for (int i = 0; i < chunk; i++)
+			uris[i] = out[base + i].uri;
+		if (ext_request(sess, host, token, EXT_KIND_ALBUM_V4, uris, chunk,
+		                &r, err, errlen) != 0)
+			break;   /* rows keep their ids; the view names them "Album" */
+		/* Matched by the uri each answer carries, not by position: the
+		 * service does not promise to answer in the order asked, and
+		 * trusting it put one album's name on another's row. */
+		for (int i = 0; i < chunk; i++) {
+			pbv au, album, v;
+			if (!ext_entity(&r, i, &au, &album))
+				break;
+			char got[48];
+			copy_str(got, sizeof(got), &au);
+			sp_release *rel = NULL;
+			for (int j = 0; j < chunk; j++)
+				if (strcmp(out[base + j].uri, got) == 0)
+					rel = &out[base + j];
+			if (!rel)
+				continue;
+			if (pb_get_bytes(album.p, album.len, 2, &v))
+				copy_str(rel->name, sizeof(rel->name), &v);
+			if (pb_get_bytes(album.p, album.len, 6, &v)) {   /* Date */
+				uint64_t y = 0;
+				if (pb_get_varint(v.p, v.len, 1, &y))
+					rel->year = (int)y;
+			}
+			char ids[3][41] = {{0}};
+			pbv group;
+			if (pb_get_bytes(album.p, album.len, 17, &group))
+				read_image_ids(&group, 1, ids);
+			if (!ids[0][0] && !ids[1][0] && !ids[2][0])
+				read_image_ids(&album, 9, ids);
+			const char *small = ids[1][0] ? ids[1] : ids[0][0] ? ids[0] : ids[2];
+			if (small[0])
+				snprintf(rel->art, sizeof(rel->art),
+				         "https://i.scdn.co/image/%s", small);
+		}
+		http_reply_free(&r);
+	}
+	return n;
+}
+
+int sp_playlist_add(const char *host, const char *token,
+                    const char *playlist_uri, const char *track_uri,
+                    char *err, size_t errlen)
+{
+	if (strncmp(playlist_uri, "spotify:playlist:", 17) != 0) {
+		snprintf(err, errlen, "not a playlist");
+		return -1;
+	}
+	const char *id = playlist_uri + 17;
+
+	/* The current revision (and whether this account may edit it): a
+	 * change is applied on top of a revision, never blind. */
+	char path[160];
+	snprintf(path, sizeof(path), "/playlist/v2/playlist/%s", id);
+	http_reply r;
+	if (http_get_proto(host, path, token, &r) != 0) {
+		snprintf(err, errlen, "playlist: %s", r.err);
+		return -1;
+	}
+	if (r.status != 200) {
+		snprintf(err, errlen, "playlist returned HTTP %d", r.status);
+		http_reply_free(&r);
+		return -1;
+	}
+	const uint8_t *body = (const uint8_t *)r.body;
+	pbv rev, caps;
+	uint8_t revision[64];
+	size_t rev_len = 0;
+	if (pb_get_bytes(body, r.len, 1, &rev) && rev.len <= sizeof(revision)) {
+		memcpy(revision, rev.p, rev.len);
+		rev_len = rev.len;
+	}
+	/* SelectedListContent.capabilities.can_edit_items, when sent. */
+	bool editable = true;
+	if (pb_get_bytes(body, r.len, 18, &caps)) {
+		uint64_t can_edit = 0;
+		editable = pb_get_varint(caps.p, caps.len, 5, &can_edit) && can_edit;
+	}
+	http_reply_free(&r);
+	if (!editable) {
+		snprintf(err, errlen, "not your playlist");
+		return -1;
+	}
+	if (!rev_len) {
+		snprintf(err, errlen, "playlist has no revision");
+		return -1;
+	}
+
+	/* ListChanges{ base_revision, deltas:[ Delta{ ops:[ Op{ kind: ADD,
+	 * add: Add{ items:[Item{uri}], add_last: true } } ] } ] } */
+	uint8_t item_s[96], add_s[128], op_s[160], delta_s[192], lc_s[288];
+	pb item, add, op, delta, lc;
+	pb_init(&item, item_s, sizeof(item_s));
+	pb_str(&item, 1, track_uri);
+	pb_init(&add, add_s, sizeof(add_s));
+	pb_sub(&add, 2, &item);
+	pb_varint(&add, 4, 1);
+	pb_init(&op, op_s, sizeof(op_s));
+	pb_varint(&op, 1, 2);            /* Op.Kind.ADD */
+	pb_sub(&op, 2, &add);
+	pb_init(&delta, delta_s, sizeof(delta_s));
+	pb_sub(&delta, 2, &op);
+	pb_init(&lc, lc_s, sizeof(lc_s));
+	pb_bytes(&lc, 1, revision, rev_len);
+	pb_sub(&lc, 2, &delta);
+	if (!pb_ok(&lc)) {
+		snprintf(err, errlen, "change did not fit");
+		return -1;
+	}
+
+	snprintf(path, sizeof(path), "/playlist/v2/playlist/%s/changes", id);
+	if (http_request(host, path, "POST", token, "application/x-protobuf",
+	                 "application/x-protobuf", lc.p, lc.len, 0, &r) != 0) {
+		snprintf(err, errlen, "changes: %s", r.err);
+		return -1;
+	}
+	const int status = r.status;
+	http_reply_free(&r);
+	if (status != 200) {
+		if (status == 403)
+			snprintf(err, errlen, "not your playlist");
+		else
+			snprintf(err, errlen, "changes returned HTTP %d", status);
+		return -1;
+	}
+	return 0;
+}
+
+int sp_context_tracks(const char *host, const char *token, const char *uri,
+                      char uris[][64], int max, char *err, size_t errlen)
+{
+	char path[160];
+	snprintf(path, sizeof(path), "/context-resolve/v1/%s", uri);
+
+	http_reply r;
+	if (http_get(host, path, token, &r) != 0) {
+		snprintf(err, errlen, "context: %s", r.err);
+		return -1;
+	}
+	if (r.status != 200) {
+		snprintf(err, errlen, "context returned HTTP %d", r.status);
+		http_reply_free(&r);
+		return -1;
+	}
+
+	/* Same shape as liked: pages[].tracks[].uri, one page per disc. */
+	int count = context_pages(host, token, r.body, uris, max, true);
+	http_reply_free(&r);
+	if (count == 0)
+		snprintf(err, errlen, "no tracks in %s", uri);
 	return count;
 }
 
@@ -678,6 +1143,13 @@ int sp_storage_resolve(const char *host, const char *token,
                        const uint8_t file_id[20], sp_storage *out,
                        char *err, size_t errlen)
 {
+	return sp_storage_resolve_s(NULL, host, token, file_id, out, err, errlen);
+}
+
+int sp_storage_resolve_s(http_session *sess, const char *host,
+                         const char *token, const uint8_t file_id[20],
+                         sp_storage *out, char *err, size_t errlen)
+{
 	memset(out, 0, sizeof(*out));
 
 	char hex[41];
@@ -689,7 +1161,7 @@ int sp_storage_resolve(const char *host, const char *token,
 	         "/storage-resolve/files/audio/interactive/%s", hex);
 
 	http_reply r;
-	if (http_get_proto(host, path, token, &r) != 0) {
+	if (sp_req(sess, host, path, "GET", token, NULL, NULL, 0, &r) != 0) {
 		snprintf(err, errlen, "storage-resolve: %s", r.err);
 		return -1;
 	}
@@ -735,12 +1207,12 @@ int sp_user_image(const char *token, char *url, size_t urllen,
 	if (retry_after)
 		*retry_after = 0;
 	if (http_get("api.spotify.com", "/v1/me", token, &r) != 0) {
-		snprintf(err, errlen, "perfil: %s", r.err);
+		snprintf(err, errlen, "profile: %s", r.err);
 		http_reply_free(&r);
 		return -1;
 	}
 	if (r.status != 200) {
-		snprintf(err, errlen, "perfil: HTTP %d", r.status);
+		snprintf(err, errlen, "profile: HTTP %d", r.status);
 		if (r.status == 429 && retry_after)
 			*retry_after = r.retry_after;
 		http_reply_free(&r);
@@ -769,7 +1241,7 @@ int sp_user_image(const char *token, char *url, size_t urllen,
 	}
 	http_reply_free(&r);
 	if (!url[0]) {
-		snprintf(err, errlen, "la cuenta no tiene foto usable");
+		snprintf(err, errlen, "the account has no usable picture");
 		return -1;
 	}
 	return 0;
@@ -788,14 +1260,14 @@ int sp_library_modify(const char *token, const char *track_id, bool save,
 	 * a Content-Type the tiny client does not bother with elsewhere. */
 	if (http_request("api.spotify.com", path, save ? "PUT" : "DELETE",
 	                 token, NULL, NULL, NULL, 0, 0, &r) != 0) {
-		snprintf(err, errlen, "me gusta: %s", r.err);
+		snprintf(err, errlen, "like: %s", r.err);
 		http_reply_free(&r);
 		return -1;
 	}
 	if (r.status == 429 && retry_after)
 		*retry_after = r.retry_after;
 	if (r.status != 200) {
-		snprintf(err, errlen, "me gusta: HTTP %d", r.status);
+		snprintf(err, errlen, "like: HTTP %d", r.status);
 		http_reply_free(&r);
 		return r.status == 403 ? 1 : -1;   /* 1: missing scope, re-pair */
 	}

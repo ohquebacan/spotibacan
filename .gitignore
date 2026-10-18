@@ -4,3 +4,7 @@ logs/
 __pycache__/
 client3ds/deps/
 .DS_Store
+# local build tools (makerom, the devkitPro installer)
+tools/makerom/
+tools/makerom.zip
+tools/*.pkg

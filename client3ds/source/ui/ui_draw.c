@@ -105,7 +105,7 @@ float ui_baseline(float top, type_role r)
 	return top + s_ascent * ui_scale(r);
 }
 
-static float measure_width(C2D_TextBuf fallback, const char *s, type_role r)
+static float measure_scaled(C2D_TextBuf fallback, const char *s, float sc)
 {
 	C2D_TextBuf buf = s_measure_buf ? s_measure_buf : fallback;
 	if (s_measure_buf)
@@ -114,10 +114,14 @@ static float measure_width(C2D_TextBuf fallback, const char *s, type_role r)
 	C2D_Text t;
 	C2D_TextParse(&t, buf, s);
 	C2D_TextOptimize(&t);
-	const float sc = ui_scale(r);
 	float w = 0.0f, h = 0.0f;
 	C2D_TextGetDimensions(&t, sc, sc, &w, &h);
 	return w;
+}
+
+static float measure_width(C2D_TextBuf fallback, const char *s, type_role r)
+{
+	return measure_scaled(fallback, s, ui_scale(r));
 }
 
 static int utf8_previous(const char *s, int len)
@@ -145,6 +149,25 @@ static void fit_text(C2D_TextBuf fallback, char *s, size_t cap, type_role r,
 		s[content_len + 1] = '.';
 		s[content_len + 2] = '\0';
 		if (measure_width(fallback, s, r) <= maxw)
+			return;
+	}
+}
+
+void ui_fit_scaled(C2D_TextBuf fallback, char *s, size_t cap, float sc,
+                   float maxw)
+{
+	if (maxw <= 0.0f || measure_scaled(fallback, s, sc) <= maxw)
+		return;
+
+	int content_len = (int)strlen(s);
+	while (content_len > 0) {
+		content_len = utf8_previous(s, content_len);
+		while ((size_t)content_len + 3 > cap)
+			content_len = utf8_previous(s, content_len);
+		s[content_len] = '.';
+		s[content_len + 1] = '.';
+		s[content_len + 2] = '\0';
+		if (measure_scaled(fallback, s, sc) <= maxw)
 			return;
 	}
 }

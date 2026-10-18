@@ -13,6 +13,13 @@
 
 typedef struct tls_conn tls_conn;
 
+/* The error text a handshake reports when every certificate is outside its
+ * validity window -- almost always a console clock that was never set. The
+ * UI matches the "clock:" prefix to show a translated fix instead. */
+#define TLS_ERR_CLOCK_PREFIX "clock:"
+#define TLS_ERR_CLOCK TLS_ERR_CLOCK_PREFIX \
+	" certificate dates invalid, set Date & Time in System Settings"
+
 /* Everything the probe wants to report, filled in even when the connection
  * fails -- the stage that is still zero is the one that broke. */
 typedef struct {
@@ -31,6 +38,8 @@ typedef struct {
 /* Parses the linked CA bundle and seeds the DRBG. socInit() and psInit() must
  * already have succeeded. Returns 0, or a negative mbedTLS error. */
 int  tls_global_init(void);
+/* Receives one summary line per closed connection that moved data. */
+void tls_set_logger(void (*logger)(const char *line));
 void tls_global_exit(void);
 
 /* How many anchors tls_global_init() accepted; 0 means every chain will fail. */
@@ -44,11 +53,25 @@ int  tls_anchor_count(void);
 tls_conn *tls_connect(const char *host, u16 port, int timeout_ms,
                       tls_stats *stats, char *err, size_t errlen);
 
+/* For a device on the home network, by IP: Cast speakers present a
+ * certificate signed by their own device key, which no public anchor
+ * vouches for. No chain check, no SNI, no session ticket. Never for
+ * anything on the internet. */
+tls_conn *tls_connect_lan(const char *ip, u16 port, int timeout_ms,
+                          char *err, size_t errlen);
+
 int  tls_write(tls_conn *c, const void *buf, size_t len);   /* writes all of it */
 int  tls_read(tls_conn *c, void *buf, size_t len);          /* 0 = closed */
 void tls_close(tls_conn *c);
 
 /* Renders an mbedTLS error as text; in the shipping build, as a bare number. */
 void tls_strerror(int code, char *out, size_t outlen);
+
+/* connect() for every dial (TLS hosts and the access point). Blocking for
+ * now: SOC's connect has no deadline of its own, and the non-blocking
+ * attempt at one broke sign-in on hardware. timeout_ms is unused. */
+struct sockaddr;
+int  tls_connect_timeout(int fd, const struct sockaddr *addr,
+                         unsigned addrlen, int timeout_ms);
 
 #endif

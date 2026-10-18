@@ -15,12 +15,16 @@
 #include "cfg3ds.h"
 #include "lyrics3ds.h"
 #include "native.h"
+#include "spclient.h"
+#include "eq.h"
+#include "tls3ds.h"
 #include "ui/artwork.h"
 #include "ui/lang.h"
 #include "ui/screen_list.h"
 #include "ui/screen_lyrics.h"
 #include "ui/screen_player.h"
 #include "ui/thumbs.h"
+#include "ui/visualizer.h"
 #include "ui/touch.h"
 #include "ui/ui.h"
 #include "ui/volume_overlay.h"
@@ -34,10 +38,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #define SOC_BUFFER      0x100000
-#define RING_BYTES      (512 * 1024)   // ~5.9 s at 22050 Hz stereo
+/* ~8.9 s at 44.1 kHz stereo. The cushion lets the download queue spend a
+ * few blocking seconds starting its next file without an audible gap. */
+#define RING_BYTES      (1536 * 1024)
 #define WAVE_BUFFERS    4
 #define FRAMES_PER_BUF  2048
 
@@ -69,14 +76,16 @@ static Library lib;
 static volatile bool lib_reload = false;
 
 static native_view nat_view = NATIVE_PLAYLISTS;
-static char nat_arg[64] = "";
+/* A row uri: "dlist:<playlist title>.txt" outgrows 64 bytes. */
+#define NAT_ARG_LEN 192
+static char nat_arg[NAT_ARG_LEN] = "";
 static char nat_title[48];
 static native_row nat_rows[NATIVE_ROWS];
 static int  nat_count = 0;
 static char nat_status[64] = "";
 // What the cached rows correspond to, so turning a page does not refetch.
 static native_view nat_loaded_view = (native_view)-1;
-static char nat_loaded_arg[64] = "\x01";
+static char nat_loaded_arg[NAT_ARG_LEN] = "\x01";
 
 /* Fixed views get their title from the string table, so a language change
  * renames them; TRACKS keeps the playlist name it drilled into. */
@@ -100,6 +109,35 @@ static touch_builder g_tb;
 // START opens the settings menu instead of killing the music outright: an
 // accidental press (a palm, a pocket) used to close the app mid-track.
 static bool settings_open = false;
+/* Battery for the settings header: percent from the MCU, refreshed every
+ * few seconds; -1 until the first read succeeds. */
+static int  batt_pct = -1;
+static bool batt_charging = false;
+/* Minutes left, estimated from how fast the percent has fallen since the
+ * charger came off (or the app started); -1 while there is too little to
+ * go on. The MCU gives no current draw, only the percent. */
+static int  batt_left_min = -1;
+/* The spectrum visualizer replaces the now-playing top screen while on. */
+static bool vis_open = false;
+static vis_style vis_mode = VIS_CLASSIC;
+/* "Add to playlist": a picker over the cached playlist list, the add itself
+ * done by the art worker (it is network), the outcome shown as a toast. */
+static bool pick_open = false;
+static native_row pick_rows[NATIVE_ROWS];
+static int  pick_n = 0, pick_sel = 0;
+static char pick_track[192];
+static volatile bool add_req = false;
+static char add_req_playlist[192], add_req_track[192], add_req_name[64];
+static char toast[96];
+static u64  toast_until = 0;
+
+static void toast_show(const char *msg)
+{
+	snprintf(toast, sizeof(toast), "%s", msg);
+	toast_until = osGetTime() + 3500;
+}
+/* What the playing list was called, for the status line on top. */
+static char play_ctx_title[64] = "";
 static int  settings_sel = 0;
 /* Applying a preference writes the SD card, which stalls the frame long
  * enough to read as a freeze. So a tap only arms the change; the menu draws
@@ -111,6 +149,12 @@ static u64  settings_busy_until = 0;
 // File scope because both the input loop and the drawers consult them.
 static bool muted = false;
 static bool paused = false;
+/* While casting the console stays paused; the speaker's own state is
+ * cast_paused, which is what the play button and status show. */
+static bool casting(void);
+static bool cast_paused;
+/* The START cast row's last stop: "Find speakers", past the speakers. */
+static bool cast_find_row = false;
 
 // Playback modes and the downloads preference; the settings drawer and the
 // transport both read them. The like queue lives with the files below.
@@ -122,9 +166,13 @@ static bool downloads_on = false;
 // awake it flips the wifi from infrastructure to StreetPass; either one kills
 // the stream. While a track is playing or paused, sleep is refused and the
 // ndm:u daemon is locked into infrastructure mode (the same recipe
-// Universal-Updater uses for its downloads). Released the moment playback
-// ends, so a closed lid sleeps normally again when nothing is playing.
+// Universal-Updater uses for its downloads). The download queue holds it
+// too: outside it the wifi sits in power save, and a queued list crawled at
+// ~26 KB/s against ~100 while a song played. Released only after a few
+// seconds with nothing going on, so the IDLE blip at each track handover
+// does not let a closed lid sleep between songs.
 static bool lid_mode = false;
+#define LID_RELEASE_MS 15000
 
 static void lid_mode_set(bool on)
 {
@@ -155,7 +203,7 @@ static void lid_mode_set(bool on)
 // Prev/next are only meaningful while the list still shows that view.
 static int now_idx = -1;
 static native_view now_view = NATIVE_PLAYLISTS;
-static char now_arg[64] = "";
+static char now_arg[NAT_ARG_LEN] = "";
 
 /* The playback context: a snapshot of the list the playing track came from.
  * Transport (prev/next, L/R, auto-advance) walks this copy, so it keeps
@@ -262,6 +310,10 @@ static void prefs_load(void)
 			}
 	if (cfg_get("downloads", v, sizeof(v)) && v[0] == '1')
 		downloads_on = true;
+	if (cfg_get("quality", v, sizeof(v)) && strcmp(v, "320") == 0)
+		sp_set_high_quality(true);
+	if (cfg_get("eq", v, sizeof(v)))
+		eq_set(eq_from_key(v));
 }
 
 // ---------------------------------------------------------------- ring buffer
@@ -328,6 +380,8 @@ static void audio_thread(void *arg)
 			u8 *dst = (u8 *)waves[i].data_vaddr;
 			u32 got = ring_read(dst, buf_bytes);
 			if (got < buf_bytes) memset(dst + got, 0, buf_bytes - got);
+			eq_process((int16_t *)dst, FRAMES_PER_BUF);
+			vis_feed(i, (const int16_t *)dst, FRAMES_PER_BUF);
 			DSP_FlushDataCache(dst, buf_bytes);
 			ndspChnWaveBufAdd(0, &waves[i]);
 		}
@@ -346,7 +400,7 @@ static u64 lib_retry_at = 0;   /* ms; when a failed view should refetch */
 #define VIEW_CACHE_TTL_MS (20 * 60 * 1000)
 static struct {
 	native_view view;
-	char arg[64];
+	char arg[NAT_ARG_LEN];
 	int count;
 	unsigned long long at;   /* osGetTime() when stored, 0 = empty */
 	native_row rows[NATIVE_ROWS];
@@ -368,8 +422,11 @@ static int vcache_lookup(native_view view, const char *arg)
 			           arg ? arg : "-");
 			return -1;
 		}
+		nat_count = 0;   /* hidden while rewritten; the caller publishes */
+		__sync_synchronize();
 		memcpy(nat_rows, vcache[i].rows,
 		       (size_t)vcache[i].count * sizeof(native_row));
+		__sync_synchronize();
 		lib.loading = false;   /* no spinner: the rows are already here */
 		native_log("VCACHE: hit vista=%d arg=%s (%d filas)\n", (int)view,
 		           arg ? arg : "-", vcache[i].count);
@@ -407,7 +464,7 @@ static void vcache_store(native_view view, const char *arg, int count)
 
 /* The in-flight fetch's identity, for the progressive commit below. */
 static native_view fetch_view = (native_view)-1;
-static char fetch_arg[64] = "";
+static char fetch_arg[NAT_ARG_LEN] = "";
 static volatile int fetch_total = 0;
 
 /* Progressive commit: each chunk that lands becomes visible at once, so a
@@ -436,7 +493,7 @@ static void library_fetch(void)
 	 * navigate away in the middle, so what nat_view says at the end is not
 	 * what it said at the start. */
 	const native_view view = nat_view;
-	char arg[64];
+	char arg[NAT_ARG_LEN];
 	snprintf(arg, sizeof(arg), "%s",
 	         view == NATIVE_SEARCH ? lib.query : nat_arg);
 	bool same = view == nat_loaded_view &&
@@ -497,9 +554,14 @@ static void library_fetch(void)
 				lib_retry_at = osGetTime() + 10000;
 				native_log("LISTA: fallo el fetch de la vista: %s\n", err);
 			} else {
-				nat_count = n;
+				/* The UI draws from another core now: hide the rows while
+				 * they are rewritten, publish the count after. */
+				nat_count = 0;
+				__sync_synchronize();
 				memcpy(nat_rows, stage,
 				       (size_t)n * sizeof(native_row));
+				__sync_synchronize();
+				nat_count = n;
 				nat_status[0] = '\0';
 				nat_loaded_view = view;
 				snprintf(nat_loaded_arg, sizeof(nat_loaded_arg), "%s",
@@ -698,18 +760,38 @@ static void art_thread(void *arg)
 		/* Queued likes ride out when the rate-limited Web API has a window;
 		 * same Retry-After discipline as the avatar fetch below. A 403 means
 		 * the token predates the library-modify scope: stop and say so. */
-		if (like_pending_n && !like_scope_missing) {
+		if (add_req) {
+			char err[128] = "";
+			char msg[96];
+			if (native_playlist_add(add_req_playlist, add_req_track, err,
+			                        sizeof(err)) == 0)
+				snprintf(msg, sizeof(msg), "%s %s", tr(S_PL_ADDED), add_req_name);
+			else
+				snprintf(msg, sizeof(msg), "%s: %s", tr(S_PL_FAILED), err);
+			toast_show(msg);
+			__sync_synchronize();
+			add_req = false;
+			continue;
+		}
+		/* Likes and list thumbnails are extras: while the playing song is
+		 * still downloading they wait, so they cannot starve it. */
+		const bool stream_busy = native_stream_busy();
+		if (like_pending_n && !like_scope_missing && !stream_busy) {
 			const u64 now = osGetTime();
 			if (!like_try_at ||
 			    now - like_try_at >= (u64)(like_wait_s > 0 ? like_wait_s : 5) * 1000) {
 				like_try_at = now;
-				like_wait_s = 20;
+				/* Back off on every failure, to ten minutes: the shared
+				 * client id sits behind HTTP 429 for hours at a time. */
+				like_wait_s = like_wait_s < 20 ? 20
+				              : (like_wait_s * 2 > 600 ? 600 : like_wait_s * 2);
 				const like_op op = like_pending[0];
 				char lerr[128] = "";
 				int ra = 0;
 				const int rc = native_like(op.uri, op.like, lerr,
 				                           sizeof(lerr), &ra);
 				if (rc == 0) {
+					like_wait_s = 0;   /* back to quick turns */
 					memmove(&like_pending[0], &like_pending[1],
 					        (size_t)(like_pending_n - 1) * sizeof(like_pending[0]));
 					like_pending_n--;
@@ -796,7 +878,8 @@ static void art_thread(void *arg)
 		/* Drain a few thumbnails per cycle: one fetch per pass could not
 		 * keep up with a fast fling, which read as flicker. */
 		int drain;
-		for (drain = 0; drain < 4 && thumbs_work_pending(); drain++)
+		for (drain = 0; drain < 4 && !stream_busy && thumbs_work_pending();
+		     drain++)
 			thumbs_work_one();
 		if (drain)
 			continue;
@@ -822,28 +905,35 @@ static void text_fit(const char *str, float x, float y, float scale, u32 colour,
                      float max_w)
 {
 	if (!str || !*str) return;
-	char buf[192];
-	snprintf(buf, sizeof(buf), "%s", str);
+	/* The top screen draws these twice a frame (one per eye) with strings
+	 * that change once a song: fit each once and reuse it. Fitting by
+	 * parsing into text_buf, as this used to, spent the frame's whole text
+	 * arena on long titles and blanked the bottom screen's labels. */
+	static struct {
+		char src[192], fit[192];
+		float scale, max_w;
+	} memo[12];
+	static int memo_next;
+	const char *fit = NULL;
+	for (int i = 0; i < (int)(sizeof(memo) / sizeof(memo[0])); i++)
+		if (memo[i].scale == scale && memo[i].max_w == max_w &&
+		    strcmp(memo[i].src, str) == 0) {
+			fit = memo[i].fit;
+			break;
+		}
+	if (!fit) {
+		int i = memo_next;
+		memo_next = (memo_next + 1) % (int)(sizeof(memo) / sizeof(memo[0]));
+		snprintf(memo[i].src, sizeof(memo[i].src), "%s", str);
+		snprintf(memo[i].fit, sizeof(memo[i].fit), "%s", str);
+		ui_fit_scaled(text_buf, memo[i].fit, sizeof(memo[i].fit), scale, max_w);
+		memo[i].scale = scale;
+		memo[i].max_w = max_w;
+		fit = memo[i].fit;
+	}
 
 	C2D_Text t;
-	float w = 0, h = 0;
-	C2D_TextParse(&t, text_buf, buf);
-	C2D_TextGetDimensions(&t, scale, scale, &w, &h);
-	if (w > max_w) {
-		size_t n = strlen(buf);
-		while (n > 1 && w > max_w) {
-			n--;
-			buf[n] = '\0';
-			C2D_TextParse(&t, text_buf, buf);
-			C2D_TextGetDimensions(&t, scale, scale, &w, &h);
-		}
-		if (n > 3) {
-			buf[n - 1] = '.';
-			buf[n] = '.';
-			buf[n + 1] = '\0';
-		}
-		C2D_TextParse(&t, text_buf, buf);
-	}
+	C2D_TextParse(&t, text_buf, fit);
 	C2D_TextOptimize(&t);
 	C2D_DrawText(&t, C2D_WithColor, x, y, 0.5f, scale, scale, colour);
 }
@@ -958,32 +1048,60 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 		C2D_DrawRectangle(0.0f, y0, 0.0f, TOP_W, y1 - y0, c0, c0, c1, c1);
 	}
 
+	/* Status line in what used to be an empty band: where the music comes
+	 * from on the left; queue, battery and clock on the right. Flat (no
+	 * parallax), like a system bar. */
+	{
+		const float sy = 7.0f;
+		char right[48] = "";
+		int q_done = 0, q_total = 0;
+		native_dl_progress(&q_done, &q_total);
+		if (q_total > 0)
+			snprintf(right, sizeof(right), "DL %d/%d   ", q_done, q_total);
+		if (batt_pct >= 0)
+			snprintf(right + strlen(right), sizeof(right) - strlen(right),
+			         "%s%d%%   ", batt_charging ? "+" : "", batt_pct);
+		time_t now_t = time(NULL);
+		struct tm *lt = localtime(&now_t);
+		if (lt)
+			snprintf(right + strlen(right), sizeof(right) - strlen(right),
+			         "%02d:%02d", lt->tm_hour, lt->tm_min);
+		text_at(right, TOP_W - 14.0f, sy, 0.44f,
+		        batt_pct >= 0 && batt_pct <= 15 && !batt_charging ? sk->warm
+		                                                          : sk->dim,
+		        C2D_AlignRight);
+		const char *ctx = play_idx >= 0 && play_ctx_title[0] ? play_ctx_title
+		                                                     : "SpotiBacan";
+		text_fit(ctx, 20.0f, sy, 0.44f, sk->dim, TOP_W - 20.0f - 150.0f);
+	}
+
 	// Art on the left with a real margin, text beside it, and nothing else.
 	// The text column is measured, so a long title stops at the edge instead
-	// of running off it.
-	const float ART = 152.0f;
-	const float AX = 20.0f, AY = 44.0f;
-	const float TX = AX + ART + 22.0f;
-	const float TW = TOP_W - TX - 20.0f;
+	// of running off it. Its rows line up with the cover's top and bottom.
+	const float ART = 160.0f;
+	const float AX = 20.0f, AY = 30.0f;
+	const float TX = AX + ART + 20.0f;
+	const float TW = TOP_W - TX - 18.0f;
 
 	draw_art(sk, AX + par * 3.0f, AY, ART);
 
-	text_fit(now_title[0] ? now_title : tr(S_NOTHING_PLAYING), TX + par * 2.0f, AY + 2,
+	text_fit(now_title[0] ? now_title : tr(S_NOTHING_PLAYING), TX + par * 2.0f, AY,
 	         0.70f, sk->text, TW);
-	text_fit(now_artist, TX + par * 1.4f, AY + 36, 0.54f, sk->dim, TW);
-	text_fit(now_album, TX + par * 1.0f, AY + 60, 0.46f, sk->meter, TW);
+	text_fit(now_artist, TX + par * 1.4f, AY + 30, 0.54f, sk->dim, TW);
+	text_fit(now_album, TX + par * 1.0f, AY + 52, 0.46f, sk->dim, TW);
 
+	const bool shown_paused = casting() ? cast_paused : paused;
 	const char *state = buffering ? tr(S_STATE_LOADING) :
-	                    paused    ? tr(S_STATE_PAUSED) :
+	                    shown_paused ? tr(S_STATE_PAUSED) :
 	                    muted     ? tr(S_STATE_MUTED) : tr(S_STATE_PLAYING);
-	C2D_DrawCircleSolid(TX + 5 + par * 0.8f, AY + 112, 0.1f, 4,
+	C2D_DrawCircleSolid(TX + 5 + par * 0.8f, AY + 106, 0.1f, 4,
 	                    buffering ? sk->warm : sk->accent);
-	text_at(state, TX + 18 + par * 0.8f, AY + 103, 0.46f, sk->dim, 0);
+	text_at(state, TX + 18 + par * 0.8f, AY + 97, 0.46f, sk->dim, 0);
 
 	if (now_dur > 1.0f) {
 		float done = now_pos / now_dur;
 		if (done > 1.0f) done = 1.0f;
-		float bx = TX + par * 0.6f, by = AY + 140, bw = TW;
+		float bx = TX + par * 0.6f, by = AY + ART - 22.0f, bw = TW;
 		C2D_DrawRectSolid(bx, by, 0.0f, bw, 3, sk->meter);
 		C2D_DrawRectSolid(bx, by, 0.1f, bw * done, 3, sk->accent);
 		char a[12], b[12];
@@ -1001,7 +1119,7 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 		if (n1 >= play_count)
 			n1 = (repeat_mode == 1 && play_count > 0) ? 0 : -1;
 		if (n1 >= 0) {
-			float uy = 208.0f;
+			float uy = 210.0f;
 			ui_text_tracked(text_buf, tr(S_UPNEXT),
 			                AX + par * 1.2f, ui_baseline(uy, TY_MICRO),
 			                TY_MICRO, 1.0f, sk->meter);
@@ -1017,7 +1135,7 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 				snprintf(line, sizeof(line), "%s - %s",
 				         play_labels[n2], play_subs[n2]);
 				text_fit(line, AX + 86.0f + par * 1.0f, uy + 8.0f,
-				         0.40f, sk->meter,
+				         0.40f, sk->dim,
 				         TOP_W - AX - 86.0f - 12.0f);
 			}
 		}
@@ -1025,6 +1143,34 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 
 	// Last, above whatever the top screen shows: it only reports, and the
 	// bottom screen keeps its controls uncovered.
+	volume_overlay_args va = { text_buf, volume, vol_overlay };
+	volume_overlay_draw(&va);
+}
+
+/* The visualizer's top screen: a dimmed wash of the cover colour, the
+ * song on one line, the bars below. */
+static void draw_vis_top(const Skin *sk, float par)
+{
+	const u32 tint = tint_cur ? tint_cur : sk->accent;
+	const u32 wash = C2D_Color32((u8)((tint & 0xFF) / 5), (u8)(((tint >> 8) & 0xFF) / 5),
+	                             (u8)(((tint >> 16) & 0xFF) / 5), 0xFF);
+	C2D_DrawRectangle(0.0f, 0.0f, 0.0f, TOP_W, 240.0f, wash, wash,
+	                  0xFF000000, 0xFF000000);
+	char line[200];
+	if (now_artist[0])
+		snprintf(line, sizeof(line), "%s  -  %s", now_title, now_artist);
+	else
+		snprintf(line, sizeof(line), "%s",
+		         now_title[0] ? now_title : tr(S_NOTHING_PLAYING));
+	text_fit(line, 18.0f + par * 0.6f, 12.0f, 0.56f, sk->text, TOP_W - 36.0f);
+	if (now_dur > 1.0f) {
+		char a[12], b[12], t[32];
+		clock_text(a, sizeof(a), now_pos);
+		clock_text(b, sizeof(b), now_dur);
+		snprintf(t, sizeof(t), "%s / %s", a, b);
+		text_at(t, 18.0f + par * 0.6f, 30.0f, 0.42f, sk->dim, 0);
+	}
+	vis_draw(par, tint, vis_mode);
 	volume_overlay_args va = { text_buf, volume, vol_overlay };
 	volume_overlay_draw(&va);
 }
@@ -1123,8 +1269,231 @@ static void clock_text(char *out, size_t n, float secs)
 // palm cannot kill the music. Rows draw up to z=0.1 and the list header at
 // 0.5, so the panel lives at 0.6 and its type at 0.7. It takes over the
 // touch map wholesale, so the view below cannot answer taps meant for it.
-#define SETTINGS_ROWS 6
+#define SETTINGS_ROWS 9
 #define SET_ROW0      0x7100
+
+/* Whether the list last shown holds tracks the queue can take. */
+static bool list_downloadable(void)
+{
+	return nat_view != NATIVE_PLAYLISTS && nat_view != NATIVE_DOWNLOADS &&
+	       nat_count > 0 && !native_offline();
+}
+
+/* Up/down for a long list: a press moves one row; held, it repeats after a
+ * beat and picks up speed (five rows a step after three seconds), so a
+ * 500-song list is not 500 presses. The circle pad scrolls too, faster the
+ * further it is pushed. Returns the signed number of rows to move. */
+typedef struct { u64 t0, next; } nav_hold;
+
+static int nav_repeat(nav_hold *h, u32 down)
+{
+	const u64 now = osGetTime();
+	const u32 held = hidKeysHeld();
+	const int dir = (held & KEY_DUP) ? -1 : (held & KEY_DDOWN) ? +1 : 0;
+	if (dir) {
+		if (down & (KEY_DUP | KEY_DDOWN)) {
+			h->t0 = now;
+			h->next = now + 350;
+			return dir;
+		}
+		if (now < h->next)
+			return 0;
+		const u64 held_ms = now - h->t0;
+		h->next = now + (held_ms > 1500 ? 35 : 80);
+		return dir * (held_ms > 3000 ? 5 : 1);
+	}
+	circlePosition cp;
+	hidCircleRead(&cp);
+	const int mag = cp.dy < 0 ? -cp.dy : cp.dy;   /* about 0..156 */
+	if (mag < 40 || now < h->next)
+		return 0;
+	h->next = now + (mag > 140 ? 25 : mag > 100 ? 60 : 120);
+	return (cp.dy > 0 ? -1 : +1) * (mag > 145 ? 3 : 1);
+}
+
+static int clamp_row(int sel, int total)
+{
+	if (sel >= total) sel = total - 1;
+	return sel < 0 ? 0 : sel;
+}
+
+static bool casting(void);
+
+/* START while a song plays: jump to its artist or album, or on to the
+ * settings. Same modal pattern as the settings sheet, three rows. */
+#define ACT_ROWS 9
+#define ACT_ROW0 0x7200
+static bool actions_open = false;
+static int  actions_sel = 0;
+/* Whose artist and album the menu offers, captured when it opens: the row
+ * selected in an open list, else the song playing. */
+static struct {
+	char artist[128], artist_uri[40];
+	char album[128], album_uri[40];
+	bool has_row;       /* a track row was selected: it can be queued */
+	native_row row;
+} act;
+
+/* Rows: 0 play next, 1 add to playlist, 2 artist, 3 album, 4 radio,
+ * 5 visualizer, 6 delete download, 7 play on the speaker (or back),
+ * 8 settings. Delete takes two presses:
+ * the first only arms it. */
+static bool act_delete_armed = false;
+static bool unlink_armed = false;
+
+/* The Spotify track the menu is about: the selected row, else the song
+ * playing; "" for local files (they have no catalogue id to add). */
+static const char *act_track_uri(void)
+{
+	const char *u = act.has_row ? act.row.uri : native_now_uri();
+	return strncmp(u, "spotify:track:", 14) == 0 ? u : "";
+}
+
+static bool action_enabled(int row)
+{
+	if (row == 0) return act.has_row;
+	if (row == 1) return act_track_uri()[0] != '\0' && !native_offline();
+	if (row == 2) return act.artist_uri[0] != '\0';
+	if (row == 3) return act.album_uri[0] != '\0';
+	if (row == 4) return act_track_uri()[0] != '\0' && !native_offline();
+	if (row == 5) return vis_open || native_now_uri()[0] != '\0';
+	if (row == 6) return act.has_row && strncmp(act.row.uri, "file:", 5) == 0;
+	if (row == 7) {
+		if (casting())
+			return true;
+		if (native_offline() || native_cast_finding())
+			return false;
+		if (cast_find_row || native_cast_count() == 0)
+			return true;   /* finding needs nothing playing */
+		return native_now_uri()[0] != '\0';
+	}
+	return true;
+}
+
+/* Fills act; false when neither source has anything to go to. */
+static bool actions_capture(void)
+{
+	memset(&act, 0, sizeof(act));
+	if (lib.open) {
+		const int extra = (nat_view == NATIVE_PLAYLISTS) ? 2 : 0;
+		const int idx = lib.sel - extra;
+		if (idx >= 0 && idx < nat_count && !nat_rows[idx].is_playlist &&
+		    (strncmp(nat_rows[idx].uri, "spotify:track:", 14) == 0 ||
+		     strncmp(nat_rows[idx].uri, "file:", 5) == 0)) {
+			const native_row *r = &nat_rows[idx];
+			act.has_row = true;
+			act.row = *r;
+			snprintf(act.artist, sizeof(act.artist), "%s", r->sub);
+			snprintf(act.artist_uri, sizeof(act.artist_uri), "%s", r->artist_uri);
+			snprintf(act.album, sizeof(act.album), "%s", r->album);
+			snprintf(act.album_uri, sizeof(act.album_uri), "%s", r->album_uri);
+			return true;
+		}
+	}
+	snprintf(act.artist, sizeof(act.artist), "%s", native_now_artist());
+	snprintf(act.artist_uri, sizeof(act.artist_uri), "%s", native_now_artist_uri());
+	snprintf(act.album, sizeof(act.album), "%s", native_now_album());
+	snprintf(act.album_uri, sizeof(act.album_uri), "%s", native_now_album_uri());
+	/* Anything playing (a saved song too) at least offers the visualizer. */
+	return act.artist_uri[0] || act.album_uri[0] || native_now_uri()[0];
+}
+
+static void draw_actions(const Skin *sk)
+{
+	const u32 dim   = C2D_Color32(0x00, 0x00, 0x00, 0xA8);
+	const u32 bord  = C2D_Color32(0x38, 0x38, 0x38, 0xFF);
+	const u32 panel = C2D_Color32(0x1B, 0x1B, 0x1B, 0xFF);
+	C2D_DrawRectSolid(0.0f, 0.0f, 0.6f, BOT_W, SCR_H, dim);
+	const float px = 20.0f, py = 4.0f, pw = 280.0f, ph = 232.0f;
+	C2D_DrawRectSolid(px, py, 0.6f, pw, ph, bord);
+	C2D_DrawRectSolid(px + 1.0f, py + 1.0f, 0.6f, pw - 2.0f, ph - 2.0f, panel);
+
+	ui_depth(0.7f);
+	char cast_label[80];
+	const bool find_row = cast_find_row || native_cast_count() == 0;
+	if (casting())
+		snprintf(cast_label, sizeof(cast_label), "%s", tr(S_CAST_BACK));
+	else if (native_cast_finding())
+		snprintf(cast_label, sizeof(cast_label), "%s", tr(S_CAST_FINDING));
+	else if (find_row)
+		snprintf(cast_label, sizeof(cast_label), "%s", tr(S_CAST_FIND));
+	else
+		snprintf(cast_label, sizeof(cast_label), tr(S_CAST_TO),
+		         native_cast_name());
+	const char *labels[ACT_ROWS] = { tr(S_PLAY_NEXT), tr(S_ADD_TO_PL),
+	                                 tr(S_GO_ARTIST), tr(S_GO_ALBUM),
+	                                 tr(S_GO_RADIO),
+	                                 tr(vis_open ? S_VIS_STOP : S_VIS_START),
+	                                 tr(act_delete_armed ? S_DELETE_CONFIRM
+	                                                     : S_DELETE_DL),
+	                                 cast_label,
+	                                 tr(S_SETTINGS) };
+	/* Left/right on the row walks the speakers, then "Find speakers". */
+	char cast_sub[64] = "";
+	if (!casting() && find_row)
+		snprintf(cast_sub, sizeof(cast_sub), "%s", tr(S_CAST_FIND_SUB));
+	else if (!casting())
+		snprintf(cast_sub, sizeof(cast_sub), tr(S_CAST_PICK),
+		         native_cast_current() + 1, native_cast_count());
+	const char *subs[ACT_ROWS] = { act.has_row ? act.row.label : "", "",
+	                               act.artist, act.album, "", "", "",
+	                               cast_sub, "" };
+	/* Nine rows of 25px fill the sheet; a sub line sits right under. */
+	const float rh = 25.0f, ry = py + 8.0f;
+	for (int i = 0; i < ACT_ROWS; i++) {
+		const float y = ry + i * rh;
+		const bool on = action_enabled(i);
+		if (i == actions_sel)
+			C2D_DrawRectSolid(px + 6.0f, y - 3.0f, 0.65f, pw - 12.0f,
+			                  rh - 2.0f, sk->accent);
+		const u32 fg = i == actions_sel ? sk->on_accent
+		               : (on ? sk->text : sk->dim);
+		ui_text(text_buf, labels[i], px + 16.0f,
+		        ui_baseline(y, TY_ROW_NAME), TY_ROW_NAME, pw - 32.0f, fg);
+		if (subs[i][0])
+			ui_text(text_buf, subs[i], px + 16.0f,
+			        ui_baseline(y + 13.0f, TY_ROW_SUB), TY_ROW_SUB,
+			        pw - 32.0f, i == actions_sel ? fg : sk->dim);
+		tb_add(&g_tb, px + 6.0f, y - 3.0f, pw - 12.0f, rh - 2.0f,
+		       ACT_ROW0 + i);
+	}
+	ui_depth(0.0f);
+}
+
+/* The playlist picker for "Add to playlist": a window of rows around the
+ * selection over a dimmed screen. */
+#define PICK_VIS 7
+static void draw_pick(const Skin *sk)
+{
+	const u32 dim   = C2D_Color32(0x00, 0x00, 0x00, 0xA8);
+	const u32 bord  = C2D_Color32(0x38, 0x38, 0x38, 0xFF);
+	const u32 panel = C2D_Color32(0x1B, 0x1B, 0x1B, 0xFF);
+	C2D_DrawRectSolid(0.0f, 0.0f, 0.6f, BOT_W, SCR_H, dim);
+	const float px = 12.0f, py = 6.0f, pw = 296.0f, ph = 228.0f;
+	C2D_DrawRectSolid(px, py, 0.6f, pw, ph, bord);
+	C2D_DrawRectSolid(px + 1.0f, py + 1.0f, 0.6f, pw - 2.0f, ph - 2.0f, panel);
+	ui_depth(0.7f);
+	ui_text(text_buf, tr(S_ADD_TO_PL), px + 12.0f,
+	        ui_baseline(py + 6.0f, TY_ROW_NAME), TY_ROW_NAME, pw - 24.0f, sk->warm);
+	int first = pick_sel - PICK_VIS / 2;
+	if (first > pick_n - PICK_VIS)
+		first = pick_n - PICK_VIS;
+	if (first < 0)
+		first = 0;
+	const float rh = 28.0f, ry = py + 30.0f;
+	for (int i = 0; i < PICK_VIS && first + i < pick_n; i++) {
+		const int idx = first + i;
+		const float y = ry + i * rh;
+		if (idx == pick_sel)
+			C2D_DrawRectSolid(px + 6.0f, y - 3.0f, 0.65f, pw - 12.0f, rh - 2.0f,
+			                  sk->accent);
+		ui_text(text_buf, pick_rows[idx].label, px + 14.0f,
+		        ui_baseline(y + 3.0f, TY_ROW_NAME), TY_ROW_NAME, pw - 28.0f,
+		        idx == pick_sel ? sk->on_accent : sk->text);
+		tb_add(&g_tb, px + 6.0f, y - 3.0f, pw - 12.0f, rh - 2.0f, ACT_ROW0 + 0x40 + i);
+	}
+	ui_depth(0.0f);
+}
 
 static void draw_settings(const Skin *sk)
 {
@@ -1142,6 +1511,28 @@ static void draw_settings(const Skin *sk)
 	ui_text(text_buf, tr(S_SETTINGS), px + 16.0f,
 	        ui_baseline(py + 8.0f, TY_ROW_NAME), TY_ROW_NAME, pw - 32.0f,
 	        sk->warm);
+	{
+		/* Battery and build, top right: "87%  v1.3", "+" while charging. */
+		char hdr[32] = "";
+		if (batt_pct >= 0) {
+			snprintf(hdr, sizeof(hdr), "%s%d%%", batt_charging ? "+" : "",
+			         batt_pct);
+			if (!batt_charging && batt_left_min >= 0)
+				snprintf(hdr + strlen(hdr), sizeof(hdr) - strlen(hdr),
+				         " ~%dh %02dm", batt_left_min / 60, batt_left_min % 60);
+		}
+#ifdef APP_VERSION
+		snprintf(hdr + strlen(hdr), sizeof(hdr) - strlen(hdr), "%sv%s",
+		         hdr[0] ? "   " : "", APP_VERSION);
+#endif
+		if (hdr[0]) {
+			const u32 col = batt_pct >= 0 && batt_pct <= 15 && !batt_charging
+			                ? sk->warm : sk->dim;   /* low: warn */
+			float vw = ui_text_width(text_buf, hdr, TY_ROW_SUB);
+			ui_text(text_buf, hdr, px + pw - 16.0f - vw,
+			        ui_baseline(py + 10.0f, TY_ROW_SUB), TY_ROW_SUB, vw, col);
+		}
+	}
 	if (settings_pending >= 0 || osGetTime() < settings_busy_until) {
 		// Three animated dots while the change applies and a beat after.
 		char dots[4] = "...";
@@ -1153,10 +1544,10 @@ static void draw_settings(const Skin *sk)
 	}
 
 	const char *labels[SETTINGS_ROWS] = {
-		tr(S_LANGUAGE), tr(S_ACCENT), tr(S_DOWNLOADS), tr(S_UNLINK),
-		tr(S_QUIT), tr(S_BACK_MENU),
+		tr(S_LANGUAGE), tr(S_ACCENT), tr(S_DOWNLOADS), tr(S_QUALITY),
+		tr(S_EQ), tr(S_DL_LIST), tr(S_UNLINK), tr(S_QUIT), tr(S_BACK_MENU),
 	};
-	const float rh = 27.0f, ry = py + 32.0f;
+	const float rh = 22.0f, ry = py + 26.0f;
 	for (int i = 0; i < SETTINGS_ROWS; i++) {
 		const float y = ry + i * rh;
 		if (i == settings_sel)
@@ -1188,7 +1579,33 @@ static void draw_settings(const Skin *sk)
 			        ui_baseline(y + 5.0f, TY_ROW_SUB), TY_ROW_SUB, w,
 			        downloads_on ? fg : sk->dim);
 		} else if (i == 3) {
-			ui_text(text_buf, tr(S_UNLINKED_NOTE), px + 16.0f,
+			const char *v = sp_high_quality() ? "320 kbps" : "160 kbps";
+			float w = ui_text_width(text_buf, v, TY_ROW_SUB);
+			ui_text(text_buf, v, px + pw - 16.0f - w,
+			        ui_baseline(y + 5.0f, TY_ROW_SUB), TY_ROW_SUB, w,
+			        sp_high_quality() ? fg : sk->dim);
+		} else if (i == 4) {
+			static const int EQ_NAMES[EQ_COUNT] = {
+				S_EQ_OFF, S_EQ_BASS, S_EQ_TREBLE, S_EQ_VOCAL, S_EQ_BOOST };
+			const char *v = tr(EQ_NAMES[eq_get()]);
+			float w = ui_text_width(text_buf, v, TY_ROW_SUB);
+			ui_text(text_buf, v, px + pw - 16.0f - w,
+			        ui_baseline(y + 5.0f, TY_ROW_SUB), TY_ROW_SUB, w,
+			        eq_get() != EQ_OFF ? fg : sk->dim);
+		} else if (i == 5) {
+			/* Which list it would take, or why it cannot. */
+			char note[96];
+			if (list_downloadable())
+				snprintf(note, sizeof(note), "%s (%d)", nat_title,
+				         nat_count);
+			else
+				snprintf(note, sizeof(note), "%s", tr(S_DL_LIST_NOTE));
+			ui_text(text_buf, note, px + 16.0f,
+			        ui_baseline(y + 13.0f, TY_MICRO), TY_MICRO,
+			        pw - 32.0f, i == settings_sel ? fg : sk->dim);
+		} else if (i == 6) {
+			ui_text(text_buf, tr(unlink_armed ? S_UNLINK_CONFIRM
+			                                  : S_UNLINKED_NOTE), px + 16.0f,
 			        ui_baseline(y + 14.0f, TY_MICRO), TY_MICRO,
 			        pw - 32.0f, i == settings_sel ? fg : sk->dim);
 		}
@@ -1492,12 +1909,23 @@ static void draw_queue(const Skin *sk)
 	float y = py + 8.0f;
 	ui_text(text_buf, tr(S_QUEUE), px + 12.0f,
 	        ui_baseline(y, TY_ROW_NAME), TY_ROW_NAME, pw - 24.0f, sk->warm);
+	int q_done = 0, q_total = 0;
+	native_dl_progress(&q_done, &q_total);
+	if (q_total > 0) {
+		char prog[32];
+		snprintf(prog, sizeof(prog), "%d / %d", q_done, q_total);
+		float w = ui_text_width(text_buf, prog, TY_ROW_SUB);
+		ui_text(text_buf, prog, px + pw - 12.0f - w,
+		        ui_baseline(y + 3.0f, TY_ROW_SUB), TY_ROW_SUB, w, sk->accent);
+	}
 	y += 24.0f;
 
 	char active[128];
 	const int pct = native_dl_active(active, sizeof(active));
 	if (pct >= 0) {
-		ui_text_tracked(text_buf, tr(S_QUEUE_DLING), px + 12.0f,
+		const bool saving = pct == NATIVE_DL_SAVING;
+		ui_text_tracked(text_buf, tr(saving ? S_QUEUE_SAVING : S_QUEUE_DLING),
+		                px + 12.0f,
 		                ui_baseline(y, TY_MICRO), TY_MICRO, 1.0f,
 		                sk->accent);
 		y += 13.0f;
@@ -1509,22 +1937,29 @@ static void draw_queue(const Skin *sk)
 		C2D_DrawRectSolid(px + 12.0f, y, 0.7f, pw - 24.0f, 4.0f,
 		                  C2D_Color32(0x4D, 0x4D, 0x4D, 0xFF));
 		C2D_DrawRectSolid(px + 12.0f, y, 0.7f,
-		                  (pw - 24.0f) * (float)pct / 100.0f, 4.0f,
+		                  (pw - 24.0f) * (float)(saving ? 100 : pct) / 100.0f, 4.0f,
 		                  sk->accent);
 		char pc[12];
-		snprintf(pc, sizeof(pc), "%d%%", pct);
+		snprintf(pc, sizeof(pc), "%d%%", saving ? 100 : pct);
 		ui_text(text_buf, pc, px + pw - 16.0f, ui_baseline(y + 7.0f,
 		        TY_MICRO), TY_MICRO, 40.0f, sk->dim);
 		y += 20.0f;
 	}
 
 	const int n = native_dl_queue_count();
+	if (pct < 0 && n > 0) {
+		/* Entries waiting but nothing running: the queue holds off while
+		 * the playing track still downloads, so say so. */
+		ui_text_tracked(text_buf, tr(S_QUEUE_WAITING), px + 12.0f,
+		                ui_baseline(y, TY_MICRO), TY_MICRO, 1.0f, sk->dim);
+		y += 16.0f;
+	}
 	if (pct < 0 && n == 0) {
 		ui_text(text_buf, tr(S_QUEUE_EMPTY), px + 12.0f,
 		        ui_baseline(y, TY_ROW_SUB), TY_ROW_SUB, pw - 24.0f,
 		        sk->dim);
 	} else {
-		for (int i = 0; i < n && y < py + ph - 16.0f; i++) {
+		for (int i = 0; i < n && y < py + ph - 30.0f; i++) {
 			char title[128];
 			if (!native_dl_queue_entry(i, title, sizeof(title)))
 				break;
@@ -1535,6 +1970,10 @@ static void draw_queue(const Skin *sk)
 			        sk->dim);
 			y += 14.5f;
 		}
+		if (n > 0)
+			ui_text(text_buf, tr(S_QUEUE_CLEAR), px + 12.0f,
+			        ui_baseline(py + ph - 18.0f, TY_MICRO), TY_MICRO,
+			        pw - 24.0f, sk->accent);
 	}
 	ui_depth(0.0f);
 }
@@ -1577,8 +2016,13 @@ static void draw_bottom(const Skin *sk)
 		a.track = now_title[0] ? now_title : tr(S_NOTHING_PLAYING);
 		a.artist = now_artist;
 		a.album = now_album;
-		a.playing = st == NATIVE_PLAYING && !paused;
-		a.loading = st == NATIVE_LOADING;
+		if (casting()) {   /* the button flips at the press, not the reply */
+			a.playing = !cast_paused;
+			a.loading = native_cast_state() == NATIVE_CAST_STARTING;
+		} else {
+			a.playing = st == NATIVE_PLAYING && !paused;
+			a.loading = st == NATIVE_LOADING;
+		}
 		a.muted = muted;
 		a.shuffle = shuffle_on;
 		a.repeat = repeat_mode;
@@ -1615,6 +2059,12 @@ static void draw_bottom(const Skin *sk)
 		// taps meant for the menu.
 		tb_reset(&g_tb);
 		draw_settings(sk);
+	} else if (pick_open) {
+		tb_reset(&g_tb);
+		draw_pick(sk);
+	} else if (actions_open) {
+		tb_reset(&g_tb);
+		draw_actions(sk);
 	} else if (srch_open) {
 		tb_reset(&g_tb);
 		draw_search_recents(sk);
@@ -1625,20 +2075,95 @@ static void draw_bottom(const Skin *sk)
 		tb_reset(&g_tb);
 		draw_queue(sk);
 	}
+	/* A short note over everything, e.g. "Added to Road trip". */
+	if (toast[0] && osGetTime() < toast_until) {
+		ui_depth(0.9f);
+		const float w = BOT_W - 40.0f;
+		C2D_DrawRectSolid(20.0f, SCR_H - 34.0f, 0.9f, w, 26.0f,
+		                  C2D_Color32(0x10, 0x10, 0x10, 0xEE));
+		ui_text(text_buf, toast, 30.0f, ui_baseline(SCR_H - 30.0f, TY_ROW_SUB),
+		        TY_ROW_SUB, w - 20.0f, sk->text);
+		ui_depth(0.0f);
+	}
+}
+
+/* Set while track_ended starts the next song: the ring still holds the
+ * finished song's last seconds, which must play out instead of being cut. */
+static bool auto_advance = false;
+/* Seconds of the old song left in the ring when the next one is fetched:
+ * about what a track takes to start, so the handover is near gapless. */
+#define END_LEAD_S 4
+/* The decoder finished a song; the ring is still draining it. */
+static bool end_pending = false;
+
+/* "Play next" inserts into the snapshot right after the playing row, in
+ * the order picked: queued_after counts how many already wait there.
+ * play_edited says the snapshot no longer mirrors the list on screen, so
+ * row indexes stop meaning on-screen highlights. */
+static int  queued_after = 0;
+static bool play_edited = false;
+
+static void play_step(int idx);
+
+/* Casting: the speaker in cast.txt plays and the console is its remote.
+ * The console's own player stays paused where it was, so going back is
+ * seamless unless something else was picked meanwhile. */
+static bool cast_dirty = false;     /* a new pick to send to the speaker */
+static bool cast_changed = false;   /* the speaker moved off the paused song */
+static bool cast_paused = false;
+static long cast_pos_ms = 0;        /* where the first song starts */
+static char cast_uri[192] = "";     /* the song picked while casting */
+static bool cast_was_on = false;    /* this cast got going at least once */
+static u64  cast_lost_at = 0;       /* it dropped then; A reconnects */
+#define CAST_LOST_MS 30000
+
+/* A pressed while the "lost the speaker" prompt is up. */
+static bool cast_lost_retry(void)
+{
+	if (!cast_lost_at || native_cast_state() != NATIVE_CAST_FAILED ||
+	    osGetTime() - cast_lost_at > CAST_LOST_MS)
+		return false;
+	cast_lost_at = 0;
+	cast_paused = false;
+	native_cast_reconnect();
+	return true;
+}
+
+static bool casting(void)
+{
+	const native_cast_status st = native_cast_state();
+	return st == NATIVE_CAST_STARTING || st == NATIVE_CAST_ON;
+}
+
+/* The console keeps quiet: casting, or offering to reconnect. */
+static bool cast_holds(void)
+{
+	return casting() || cast_lost_at;
 }
 
 // Starts a track by URI alone, for the shelf: no list context to remember,
 // so prev/next grey out until a list play gives them bounds again.
 static void play_uri(const char *uri)
 {
-	native_play(uri);
+	end_pending = false;
+	queued_after = 0;
+	play_edited = false;
+	if (casting()) {
+		snprintf(cast_uri, sizeof(cast_uri), "%s", uri);
+		cast_dirty = true;
+		cast_changed = true;
+		cast_pos_ms = 0;
+	} else {
+		native_play(uri);
+	}
 	now_idx = -1;
 	play_count = 0;   /* off-list: no neighbours to step to */
 	play_idx = -1;
-	buffering = true;
-	paused = false;
-	ndspChnSetPaused(0, false);
-	ring_clear();
+	buffering = !casting();
+	paused = casting();
+	ndspChnSetPaused(0, paused);
+	if (!auto_advance)
+		ring_clear();
 }
 
 // Starts a track from the cached rows and snapshots the whole list: that
@@ -1652,19 +2177,100 @@ static void play_index(int idx)
 	 * Downloads and its long path would not fit the recent entry anyway. */
 	if (strncmp(nat_rows[idx].uri, "file:", 5) != 0)
 		recents_push(nat_rows[idx].uri, nat_rows[idx].art);
+	/* Only tracks go into the snapshot: an artist view mixes in release
+	 * rows, which open rather than play. */
+	int n = 0, at = -1;
 	for (int i = 0; i < nat_count; i++) {
-		snprintf(play_uris[i], sizeof(play_uris[i]), "%s", nat_rows[i].uri);
-		snprintf(play_art[i], sizeof(play_art[i]), "%s", nat_rows[i].art);
-		snprintf(play_labels[i], sizeof(play_labels[i]), "%s",
+		if (nat_rows[i].is_playlist)
+			continue;
+		if (i == idx)
+			at = n;
+		snprintf(play_uris[n], sizeof(play_uris[n]), "%s", nat_rows[i].uri);
+		snprintf(play_art[n], sizeof(play_art[n]), "%s", nat_rows[i].art);
+		snprintf(play_labels[n], sizeof(play_labels[n]), "%s",
 		         nat_rows[i].label);
-		snprintf(play_subs[i], sizeof(play_subs[i]), "%s", nat_rows[i].sub);
+		snprintf(play_subs[n], sizeof(play_subs[n]), "%s", nat_rows[i].sub);
+		n++;
 	}
-	play_count = nat_count;
-	play_idx = idx;
+	play_count = n;
+	play_idx = at;
 	now_idx = idx;
+	/* Skipped rows shift snapshot indexes off the on-screen ones: later
+	 * steps must not highlight by index. */
+	play_edited = n != nat_count;
+	snprintf(play_ctx_title, sizeof(play_ctx_title), "%s", nat_title);
 	now_view = nat_view;
 	snprintf(now_arg, sizeof(now_arg), "%s",
 	         nat_view == NATIVE_SEARCH ? lib.query : nat_arg);
+}
+
+/* Sends what the console would play now to the speaker: the list it came
+ * from as the context (so the speaker goes on through it by itself), from
+ * that song. A saved file goes alone; the cast thread looks up its id. */
+static bool cast_start(void)
+{
+	const char *track = (play_idx >= 0 && play_idx < play_count)
+	                    ? play_uris[play_idx]
+	                    : (cast_uri[0] ? cast_uri : native_now_uri());
+	if (strncmp(track, "spotify:track:", 14) != 0 &&
+	    strncmp(track, "file:", 5) != 0) {
+		char msg[96];
+		snprintf(msg, sizeof(msg), tr(S_CAST_LOCAL), native_cast_name());
+		toast_show(msg);
+		if (casting())
+			native_cast_end();
+		return false;
+	}
+	char ctx[192];
+	if (play_idx >= 0 && (strncmp(now_arg, "spotify:playlist:", 17) == 0 ||
+	                      strncmp(now_arg, "spotify:album:", 14) == 0))
+		snprintf(ctx, sizeof(ctx), "%s", now_arg);
+	else if (play_idx >= 0 && now_view == NATIVE_LIKED)
+		snprintf(ctx, sizeof(ctx), "spotify:user:%s:collection",
+		         native_account());
+	else
+		snprintf(ctx, sizeof(ctx), "%s", track);
+	native_cast_play(ctx, strcmp(ctx, track) == 0 ? "" : track, cast_pos_ms);
+	cast_paused = false;
+	return true;
+}
+
+/* START -> "Play on <speaker>": the console pauses and the speaker takes
+ * over from the same spot. */
+static void cast_begin(void)
+{
+	cast_changed = false;
+	cast_was_on = false;
+	cast_lost_at = 0;
+	cast_uri[0] = '\0';
+	cast_pos_ms = (long)(now_pos * 1000.0f);
+	if (cast_start()) {
+		/* A song still loading would start under the speaker: drop it,
+		 * coming back replays it from the list. */
+		if (native_playback_state() != NATIVE_PLAYING) {
+			native_stop();
+			cast_changed = true;
+		}
+		paused = true;
+		ndspChnSetPaused(0, true);
+	}
+}
+
+/* START -> "Play on this console": the speaker stops; the console carries
+ * on from its paused spot, or starts what was picked while casting. */
+static void cast_finish(void)
+{
+	cast_was_on = false;
+	cast_lost_at = 0;
+	native_cast_end();
+	if (!cast_changed && native_playback_state() == NATIVE_PLAYING) {
+		paused = false;
+		ndspChnSetPaused(0, false);
+	} else if (play_idx >= 0 && play_idx < play_count) {
+		play_step(play_idx);
+	} else if (cast_uri[0]) {
+		play_uri(cast_uri);
+	}
 }
 
 // Plays a snapshot row (a manual or automatic skip). The snapshot stays the
@@ -1672,15 +2278,68 @@ static void play_index(int idx)
 // the row index still matches if that list is the one displayed.
 static void play_step(int idx)
 {
+	end_pending = false;
+	/* Walking into the queued songs uses them up one by one; jumping
+	 * anywhere else forgets the queue position. */
+	if (idx == play_idx + 1 && queued_after > 0)
+		queued_after--;
+	else if (idx != play_idx)
+		queued_after = 0;
 	if (strncmp(play_uris[idx], "file:", 5) != 0)
 		recents_push(play_uris[idx], play_art[idx]);
-	native_play(play_uris[idx]);
+	if (casting()) {
+		cast_dirty = true;
+		cast_changed = true;
+		cast_pos_ms = 0;
+	} else {
+		native_play(play_uris[idx]);
+	}
 	play_idx = idx;
-	now_idx = idx;
-	buffering = true;
-	paused = false;
-	ndspChnSetPaused(0, false);
-	ring_clear();
+	now_idx = play_edited ? -1 : idx;
+	buffering = !casting();
+	paused = casting();
+	ndspChnSetPaused(0, paused);
+	if (!auto_advance)
+		ring_clear();
+}
+
+/* Puts a row right after the playing song (after anything already queued
+ * that way). With nothing playing it simply plays the row. */
+static void play_insert_next(const native_row *r)
+{
+	const char *cur = native_now_uri();
+	if (play_idx < 0 || play_count <= 0) {
+		if (!cur[0]) {
+			play_uri(r->uri);
+			return;
+		}
+		/* Off-list (the shelf): give the playing song a context of one. */
+		snprintf(play_uris[0], sizeof(play_uris[0]), "%s", cur);
+		snprintf(play_art[0], sizeof(play_art[0]), "%s", native_now_art());
+		snprintf(play_labels[0], sizeof(play_labels[0]), "%s", now_title);
+		snprintf(play_subs[0], sizeof(play_subs[0]), "%s", now_artist);
+		play_count = 1;
+		play_idx = 0;
+		queued_after = 0;
+	}
+	if (play_count >= NATIVE_ROWS)
+		play_count = NATIVE_ROWS - 1;   /* the list's tail gives way */
+	int at = play_idx + 1 + queued_after;
+	if (at > play_count)
+		at = play_count;
+	const int tail = play_count - at;
+	memmove(play_uris[at + 1], play_uris[at], (size_t)tail * sizeof(play_uris[0]));
+	memmove(play_art[at + 1], play_art[at], (size_t)tail * sizeof(play_art[0]));
+	memmove(play_labels[at + 1], play_labels[at], (size_t)tail * sizeof(play_labels[0]));
+	memmove(play_subs[at + 1], play_subs[at], (size_t)tail * sizeof(play_subs[0]));
+	snprintf(play_uris[at], sizeof(play_uris[at]), "%s", r->uri);
+	snprintf(play_art[at], sizeof(play_art[at]), "%s", r->art);
+	snprintf(play_labels[at], sizeof(play_labels[at]), "%s", r->label);
+	snprintf(play_subs[at], sizeof(play_subs[at]), "%s", r->sub);
+	play_count++;
+	queued_after++;
+	play_edited = true;
+	now_idx = -1;   /* list rows and snapshot rows no longer line up */
 }
 
 // Whether the list still shows the view the playing track came from.
@@ -1698,6 +2357,9 @@ static int step_index(int dir)
 {
 	if (play_count == 0 || play_idx < 0)
 		return -1;
+	/* What the user queued plays next, shuffle or not. */
+	if (dir > 0 && queued_after > 0 && play_idx + 1 < play_count)
+		return play_idx + 1;
 	if (shuffle_on && play_count > 1) {
 		int r;
 		do {
@@ -1714,8 +2376,14 @@ static int step_index(int dir)
  * Anything played off-list (the shelf) simply stops. */
 static void track_ended(void)
 {
+	auto_advance = true;
 	if (repeat_mode == 2 && native_now_uri()[0]) {
-		play_uri(native_now_uri());
+		/* Replay in place, keeping the list (and any queue) around it. */
+		if (play_idx >= 0 && play_idx < play_count)
+			play_step(play_idx);
+		else
+			play_uri(native_now_uri());
+		auto_advance = false;
 		return;
 	}
 	int next = step_index(+1);
@@ -1723,10 +2391,29 @@ static void track_ended(void)
 		next = 0;
 	if (next >= 0)
 		play_step(next);
+	auto_advance = false;
 }
 
 // What activating an absolute list row means: the synthetic Liked Songs or
 // Downloads rows, drilling into a playlist, or playing a track.
+/* One step up: a saved playlist inside Downloads goes back to Downloads,
+ * everything else to the playlists. */
+static void lib_back(void)
+{
+	if (nat_view == NATIVE_DOWNLOADS && nat_arg[0]) {
+		nat_arg[0] = '\0';
+		snprintf(nat_title, sizeof(nat_title), "%s", tr(S_DL_VIEW));
+	} else {
+		nat_view = NATIVE_PLAYLISTS;
+		nat_arg[0] = '\0';
+		snprintf(nat_title, sizeof(nat_title), "%s", tr(S_LISTS));
+	}
+	lib.sel = 0;
+	native_fetch_cancel();   /* drop the old view's in-flight fetch */
+	lib.scroll = lib.velocity = 0.0f;
+	lib_reload = true;
+}
+
 static void activate_row(int abs)
 {
 	int extra = (nat_view == NATIVE_PLAYLISTS) ? 2 : 0;
@@ -1739,9 +2426,19 @@ static void activate_row(int abs)
 		nat_view = NATIVE_DOWNLOADS;
 		nat_arg[0] = '\0';
 		snprintf(nat_title, sizeof(nat_title), "%s", tr(S_DL_VIEW));
+	} else if (idx >= 0 && idx < nat_count && nat_rows[idx].is_playlist &&
+	           strncmp(nat_rows[idx].uri, "dlist:", 6) == 0) {
+		/* A saved playlist inside Downloads: the same view, narrowed. */
+		snprintf(nat_arg, sizeof(nat_arg), "%s", nat_rows[idx].uri);
+		snprintf(nat_title, sizeof(nat_title), "%s", nat_rows[idx].label);
+		nat_view = NATIVE_DOWNLOADS;
 	} else if (idx >= 0 && idx < nat_count && nat_rows[idx].is_playlist) {
 		snprintf(nat_arg, sizeof(nat_arg), "%s", nat_rows[idx].uri);
-		if (native_playlist_name(nat_arg, nat_title, sizeof(nat_title)) != 0)
+		if (strncmp(nat_arg, "spotify:album:", 14) == 0 ||
+		    strncmp(nat_arg, "spotify:artist:", 15) == 0)
+			/* Release and artist rows already know their name. */
+			snprintf(nat_title, sizeof(nat_title), "%s", nat_rows[idx].label);
+		else if (native_playlist_name(nat_arg, nat_title, sizeof(nat_title)) != 0)
 			snprintf(nat_title, sizeof(nat_title), "%s", tr(S_PLAYLIST_FALLBACK));
 		nat_view = NATIVE_TRACKS;
 	} else if (idx >= 0 && idx < nat_count) {
@@ -1805,6 +2502,26 @@ static char setup_code[16] = "";
 static char setup_url[128] = "";
 static char setup_error[192] = "";
 
+/* The few failures a person can do something about, in their language;
+ * anything else is shown as the backend reported it. */
+static const char *friendly_error(const char *e)
+{
+	if (!e)
+		return "";
+	if (strncmp(e, TLS_ERR_CLOCK_PREFIX, strlen(TLS_ERR_CLOCK_PREFIX)) == 0)
+		return tr(S_ERR_CLOCK);
+	if (strncmp(e, NATIVE_ERR_KEY_BLOCKED, 11) == 0)
+		return tr(S_ERR_KEY_BLOCKED);
+	/* A refused audio key is an account/catalog answer, not a bug: the
+	 * friendly line, with the hex code left in the log. */
+	if (strstr(e, "no permite esta cancion"))
+		return tr(S_PREMIUM_REQ);
+	if (strstr(e, "DNS failed") || strstr(e, "connect()") ||
+	    strstr(e, "Network init"))
+		return tr(S_ERR_NETWORK);
+	return e;
+}
+
 static C3D_RenderTarget *g_top, *g_bottom;
 
 // One painted screen for everything that happens before the library exists:
@@ -1819,7 +2536,16 @@ static void draw_setup(void)
 	C2D_SceneBegin(g_top);
 	if (setup_error[0]) {
 		text_at(tr(S_SIGNIN_FAIL), 28, 40, 0.80f, sk->warm, 0);
-		text_fit(setup_error, 28, 86, 0.50f, sk->text, TOP_W - 56);
+		/* Wrapped, not clipped: the useful half of these messages ("set
+		 * the Date & Time") used to fall off the right edge. */
+		const char *nice = friendly_error(setup_error);
+		float bl = ui_text_wrapped(text_buf, nice, 28.0f,
+		                           ui_baseline(80.0f, TY_ROW_NAME),
+		                           TY_ROW_NAME, TOP_W - 56.0f, sk->text, 5,
+		                           1.35f);
+		if (nice != setup_error)
+			ui_text_wrapped(text_buf, setup_error, 28.0f, bl + 22.0f,
+			                TY_ROW_SUB, TOP_W - 56.0f, sk->dim, 3, 1.3f);
 	} else if (setup_code[0]) {
 		text_at(tr(S_PAIR_TITLE), 28, 36, 0.80f, sk->warm, 0);
 		text_at(tr(S_PAIR_LINE1), 28, 84, 0.50f, sk->dim, 0);
@@ -1844,7 +2570,9 @@ static void draw_setup(void)
 		/* The offline hint is the useful action here, so it gets the
 		 * middle of the screen in accent, not a line clipped under the
 		 * bar. */
-		text_at(tr(S_OFFLINE_A), BOT_W / 2, 108, 0.56f, sk->accent,
+		text_at(tr(S_X_RETRY), BOT_W / 2, 84, 0.56f, sk->accent,
+		        C2D_AlignCenter);
+		text_at(tr(S_OFFLINE_A), BOT_W / 2, 124, 0.56f, sk->accent,
 		        C2D_AlignCenter);
 		C2D_DrawRectSolid(0, BAR_Y, 0.0f, BOT_W, SCR_H - BAR_Y, sk->accent);
 		text_at(tr(S_START_QUIT), BOT_W / 2, BAR_Y + 10, 0.54f, sk->on_accent,
@@ -1880,10 +2608,31 @@ static bool pair_poll_frame(int attempt)
 	return aptMainLoop();
 }
 
+/* Sleep and HOME land in the log with their time, for "slow after the
+ * lid opened"; waking also tells the backend its links are gone. */
+static aptHookCookie apt_cookie;
+
+static void apt_event(APT_HookType hook, void *param)
+{
+	(void)param;
+	switch (hook) {
+	case APTHOOK_ONSLEEP:   native_log("APT: sleep\n"); break;
+	case APTHOOK_ONWAKEUP:  native_log("APT: wake\n"); native_on_wake(); break;
+	case APTHOOK_ONSUSPEND: native_log("APT: HOME\n"); break;
+	case APTHOOK_ONRESTORE: native_log("APT: back from HOME\n"); break;
+	default: break;
+	}
+}
+
 int main(int argc, char **argv)
 {
 	(void)argc;
 	gfxInitDefault();
+	/* Let the network workers borrow the system core. Half of it: the
+	 * console's own network services run there too, and starving them
+	 * would slow the very downloads this is meant to speed up. */
+	APT_SetAppCpuTimeLimit(50);
+	aptHook(&apt_cookie, apt_event, NULL);
 	skin_init();
 	// The token belongs beside the .3dsx, like every other app here; without
 	// this it would land at the card root and not match the probes.
@@ -1922,6 +2671,7 @@ int main(int argc, char **argv)
 		mix[0] = mix[1] = 1.0f;
 		ndspChnSetMix(0, mix);
 		mcuHwcInit();   // the overlay follows the hardware volume slider
+		ptmuInit();     // charging state for the battery readout
 		audio = linearAlloc(buf_bytes * WAVE_BUFFERS);
 		if (!audio) fail = "Audio memory failed.";
 	}
@@ -1958,6 +2708,9 @@ int main(int argc, char **argv)
 
 		// First run on a console: pair here rather than in a separate tool.
 		bool ok = true;
+	retry_signin:
+		ok = true;
+		setup_error[0] = '\0';
 		if (!native_has_token())
 			ok = native_pair(pair_show_code, pair_poll_frame, nat_err,
 			                 sizeof(nat_err)) == 0;
@@ -1973,6 +2726,12 @@ int main(int argc, char **argv)
 			while (aptMainLoop()) {
 				hidScanInput();
 				u32 d = hidKeysDown();
+				if (d & KEY_X) {
+					/* A fixed clock or a found network needs no restart. */
+					snprintf(setup_step, sizeof(setup_step), "%s",
+					         tr(S_STARTING));
+					goto retry_signin;
+				}
 				if (d & KEY_A) {
 					ok = native_init_offline(&sink) == 0;
 					if (ok) {
@@ -2001,9 +2760,14 @@ int main(int argc, char **argv)
 	// The lister and art threads run TLS handshakes on these stacks, which
 	// need real headroom (chunked metadata names a 500-song list as a
 	// dozen sequential handshakes); the audio thread only copies bytes.
-	Thread lister = threadCreate(native_library_thread, NULL, 96 * 1024, 0x3F, -2, false);
+	/* Lists and covers are network work: off the app core with the
+	 * downloads, so drawing and decoding keep it to themselves. They rank
+	 * above the download workers (0x31), though: someone is waiting on a
+	 * list, nobody on the queue, and at the bottom a list starved behind
+	 * a queued song (a search named 20 songs in 6.4 s, 0.3 s idle). */
+	Thread lister = native_spawn_worker(native_library_thread, NULL, 96 * 1024, 0x30);
 	Thread snd = threadCreate(audio_thread, NULL, 16 * 1024, 0x18, -2, false);
-	Thread art = threadCreate(art_thread, NULL, 96 * 1024, 0x32, -2, false);
+	Thread art = native_spawn_worker(art_thread, NULL, 96 * 1024, 0x30);
 	buffering = false;
 	lib.open = true;
 	lib_reload = true;
@@ -2032,6 +2796,10 @@ int main(int argc, char **argv)
 		// The rects belong to the frame just drawn, so this runs before any
 		// of them are rebuilt below.
 		touch_update(&g_touch, g_tb.rects, g_tb.n);
+		/* B closes the list, then B on the player opens it again: judged
+		 * against the state at the top of the frame, so one press never
+		 * does both. */
+		const bool lib_was_open = lib.open;
 
 		// A settings change armed last frame applies now: the menu already
 		// showed its busy hint, so the SD write stalls behind feedback
@@ -2051,6 +2819,14 @@ int main(int argc, char **argv)
 				downloads_on = !downloads_on;
 				native_set_downloads(downloads_on);
 				cfg_set("downloads", downloads_on ? "1" : "0");
+			} else if (row == 3) {
+				/* Takes effect from the next track fetched. */
+				sp_set_high_quality(!sp_high_quality());
+				cfg_set("quality", sp_high_quality() ? "320" : "160");
+			} else if (row == 4) {
+				/* Heard at once: the filter sits after the ring. */
+				eq_set((eq_preset)((eq_get() + 1) % EQ_COUNT));
+				cfg_set("eq", eq_key(eq_get()));
 			}
 			settings_busy_until = osGetTime() + 700;
 		}
@@ -2071,22 +2847,172 @@ int main(int argc, char **argv)
 			if (g_touch.clicked >= SET_ROW0 &&
 			    g_touch.clicked < SET_ROW0 + SETTINGS_ROWS)
 				row = g_touch.clicked - SET_ROW0;
+			if (settings_sel != 6 || (row >= 0 && row != 6))
+				unlink_armed = false;   /* moving away disarms unlink */
 			switch (row) {
 			case 0:   // language -- applied next frame, after the busy hint
 			case 1:   // accent colour -- same
 			case 2:   // downloads toggle -- same
+			case 3:   // audio quality -- same
+			case 4:   // equalizer preset -- same
 				settings_pending = row;
 				break;
-			case 3:   // unlink: wipe the token (and prefs) and leave
+			case 5:   // queue every track of the list last shown
+				if (list_downloadable()) {
+					settings_open = false;
+					if (native_dl_enqueue_list(nat_rows, nat_count,
+					                           nat_title) > 0)
+						queue_open = true;   /* show what got queued */
+					else
+						toast_show(tr(S_DL_ALL_SAVED));   /* nothing new */
+				}
+				break;
+			case 6:   // unlink: wipe the token (and prefs) and leave
+				/* Re-pairing needs a phone: ask once more, as delete does. */
+				if (!unlink_armed) {
+					unlink_armed = true;
+					break;
+				}
 				cfg_clear();
 				goto quit;
-			case 4:   // quit
+			case 7:   // quit
 				goto quit;
 			default:
 				break;
 			}
-			if (row == SETTINGS_ROWS - 1 || (down & (KEY_B | KEY_START)))
+			if (row == SETTINGS_ROWS - 1 || (down & (KEY_B | KEY_START))) {
 				settings_open = false;
+				unlink_armed = false;
+			}
+			down = 0;
+			g_touch.clicked = -1;
+			g_touch.long_pressed = -1;
+		} else if (pick_open) {
+			static nav_hold pick_hold;
+			const int step = nav_repeat(&pick_hold, down);
+			if (step && pick_n)
+				pick_sel = clamp_row(pick_sel + step, pick_n);
+			if (down & KEY_L)
+				pick_sel = pick_sel > PICK_VIS ? pick_sel - PICK_VIS : 0;
+			if (down & KEY_R)
+				pick_sel = pick_sel + PICK_VIS < pick_n ? pick_sel + PICK_VIS
+				                                        : pick_n - 1;
+			int chosen = -1;
+			if (down & KEY_A)
+				chosen = pick_sel;
+			if (g_touch.clicked >= ACT_ROW0 + 0x40 &&
+			    g_touch.clicked < ACT_ROW0 + 0x40 + PICK_VIS) {
+				int first = pick_sel - PICK_VIS / 2;
+				if (first > pick_n - PICK_VIS)
+					first = pick_n - PICK_VIS;
+				if (first < 0)
+					first = 0;
+				chosen = first + (g_touch.clicked - ACT_ROW0 - 0x40);
+			}
+			if (chosen >= 0 && chosen < pick_n && !add_req) {
+				snprintf(add_req_playlist, sizeof(add_req_playlist), "%s",
+				         pick_rows[chosen].uri);
+				snprintf(add_req_name, sizeof(add_req_name), "%s",
+				         pick_rows[chosen].label);
+				snprintf(add_req_track, sizeof(add_req_track), "%s", pick_track);
+				__sync_synchronize();
+				add_req = true;
+				toast_show(tr(S_PL_ADDING));
+				pick_open = false;
+			}
+			if (down & (KEY_B | KEY_START))
+				pick_open = false;
+			down = 0;
+			g_touch.clicked = -1;
+			g_touch.long_pressed = -1;
+		} else if (actions_open) {
+			if (down & (KEY_DUP | KEY_DDOWN))
+				act_delete_armed = false;   /* moving away disarms delete */
+			if (down & KEY_DUP)
+				actions_sel = actions_sel > 0 ? actions_sel - 1 : ACT_ROWS - 1;
+			if (down & KEY_DDOWN)
+				actions_sel = actions_sel + 1 < ACT_ROWS ? actions_sel + 1 : 0;
+			const int ncast = native_cast_count();
+			if (actions_sel == 7 && !casting() && ncast > 0 &&
+			    !native_cast_finding() &&
+			    (down & (KEY_DLEFT | KEY_DRIGHT))) {
+				const int dir = (down & KEY_DRIGHT) ? +1 : -1;
+				int pos = cast_find_row ? ncast : native_cast_current();
+				pos = (pos + dir + ncast + 1) % (ncast + 1);
+				cast_find_row = pos == ncast;
+				if (!cast_find_row)
+					native_cast_pick(pos);
+			}
+			int row = -1;
+			if (down & KEY_A)
+				row = actions_sel;
+			if (g_touch.clicked >= ACT_ROW0 &&
+			    g_touch.clicked < ACT_ROW0 + ACT_ROWS)
+				row = g_touch.clicked - ACT_ROW0;
+			if (row == 6 && action_enabled(6) && !act_delete_armed) {
+				act_delete_armed = true;   /* ask once more */
+				row = -1;
+			}
+			if (row >= 0 && action_enabled(row)) {
+				actions_open = false;
+				if (row == 0) {
+					play_insert_next(&act.row);
+				} else if (row == 1) {
+					snprintf(pick_track, sizeof(pick_track), "%s",
+					         act_track_uri());
+					pick_n = native_playlists_cached(pick_rows, NATIVE_ROWS);
+					pick_sel = 0;
+					if (pick_n > 0)
+						pick_open = true;
+					else
+						toast_show(tr(S_PL_NONE));
+				} else if (row == 4) {
+					/* A radio seeded from the song, as X does in a list. */
+					snprintf(nat_arg, sizeof(nat_arg), "%s", act_track_uri());
+					nat_view = NATIVE_RADIO;
+					snprintf(nat_title, sizeof(nat_title), "%s", tr(S_RADIO));
+					lib.open = true;
+					lib.sel = 0;
+					native_fetch_cancel();
+					lib.scroll = lib.velocity = 0.0f;
+					lib_reload = true;
+				} else if (row == 5) {
+					vis_open = !vis_open;
+					if (vis_open)
+						lib.open = false;   /* the player stays below */
+				} else if (row == 6) {
+					act_delete_armed = false;
+					native_delete_download(act.row.uri);
+					lib_reload = true;   /* the Downloads list rereads the card */
+					nat_loaded_view = (native_view)-1;
+				} else if (row == 7) {
+					if (casting()) {
+						cast_finish();
+					} else if (cast_find_row || native_cast_count() == 0) {
+						native_cast_find();
+						toast_show(tr(S_CAST_FINDING));
+					} else {
+						cast_begin();
+					}
+				} else if (row == 8) {
+					settings_open = true;
+					settings_sel = 0;
+				} else {
+					/* An album or artist opens like a playlist would. */
+					nat_view = NATIVE_TRACKS;
+					snprintf(nat_arg, sizeof(nat_arg), "%s",
+					         row == 2 ? act.artist_uri : act.album_uri);
+					snprintf(nat_title, sizeof(nat_title), "%s",
+					         row == 2 ? act.artist : act.album);
+					lib.open = true;
+					lib.sel = 0;
+					native_fetch_cancel();
+					lib.scroll = lib.velocity = 0.0f;
+					lib_reload = true;
+				}
+			}
+			if (down & (KEY_B | KEY_START))
+				actions_open = false;
 			down = 0;
 			g_touch.clicked = -1;
 			g_touch.long_pressed = -1;
@@ -2128,9 +3054,11 @@ int main(int argc, char **argv)
 			g_touch.clicked = -1;
 			g_touch.long_pressed = -1;
 		} else if (queue_open) {
-			// Read-only and live: a key or a tap anywhere closes it.
-			if (down & (KEY_B | KEY_START | KEY_SELECT | KEY_A) ||
-			    g_touch.clicked >= 0)
+			// Live: X empties what is still waiting, anything else closes.
+			if (down & KEY_X)
+				native_dl_clear();
+			else if (down & (KEY_B | KEY_START | KEY_SELECT | KEY_A) ||
+			         g_touch.clicked >= 0)
 				queue_open = false;
 			down = 0;
 			g_touch.clicked = -1;
@@ -2139,8 +3067,18 @@ int main(int argc, char **argv)
 			help_open = true;
 			down = 0;
 		} else if (down & KEY_START) {
-			settings_open = true;
-			settings_sel = 0;
+			/* With a Spotify track playing, START offers its artist and
+			 * album first; otherwise it is straight to the settings. */
+			if (actions_capture()) {
+				actions_open = true;
+				act_delete_armed = false;
+				/* In Downloads the likely wish is the delete row. */
+				actions_sel = strncmp(act.row.uri, "file:", 5) == 0 ? 6
+				              : (act.has_row ? 0 : 5);
+			} else {
+				settings_open = true;
+				settings_sel = 0;
+			}
 			down = 0;
 		}
 
@@ -2163,6 +3101,7 @@ int main(int argc, char **argv)
 				now_pos = frac * now_dur;
 			} else {
 				native_seek(now_pos);
+				ring_clear();   /* the cushion holds pre-seek audio */
 				scrubbing = false;
 			}
 		}
@@ -2171,18 +3110,32 @@ int main(int argc, char **argv)
 		if (!lib.open && !lyr_open && g_touch.clicked >= 0) {
 			switch (g_touch.clicked) {
 			case BTN_P_PLAY:
-				if (native_playback_state() == NATIVE_PLAYING) {
+				if (cast_lost_retry()) {
+				} else if (casting()) {
+					cast_paused = !cast_paused;
+					native_cast_command(cast_paused ? "pause" : "resume");
+				} else if (native_playback_state() == NATIVE_PLAYING) {
 					paused = !paused;
 					ndspChnSetPaused(0, paused);
 				}
 				break;
 			case BTN_P_PREV: {
+				if (casting()) {
+					native_cast_command("skip_prev");
+					cast_changed = true;
+					break;
+				}
 				const int t = step_index(-1);
 				if (t >= 0)
 					play_step(t);
 				break;
 			}
 			case BTN_P_NEXT: {
+				if (casting()) {
+					native_cast_command("skip_next");
+					cast_changed = true;
+					break;
+				}
 				const int t = step_index(+1);
 				if (t >= 0)
 					play_step(t);
@@ -2250,12 +3203,11 @@ int main(int argc, char **argv)
 			if (st != nat_state_seen) {
 				const int prev_state = nat_state_seen;
 				nat_state_seen = (int)st;
-				if (st == NATIVE_PLAYING)
-					lid_mode_set(true);
-				else if (st == NATIVE_IDLE || st == NATIVE_FAILED)
-					lid_mode_set(false);
+				/* The decoder is done, the speaker is not: wait until
+				 * about as much audio is left as the next track takes to
+				 * start, then fetch it, so neither end gets cut. */
 				if (st == NATIVE_IDLE && prev_state == NATIVE_PLAYING)
-					track_ended();
+					end_pending = true;
 				switch (st) {
 				case NATIVE_LOADING:
 					snprintf(now_title, sizeof(now_title), "%s", tr(S_LOADING_DOTS));
@@ -2264,25 +3216,48 @@ int main(int argc, char **argv)
 					break;
 				case NATIVE_FAILED:
 					snprintf(now_title, sizeof(now_title), "%s", tr(S_PLAY_FAIL));
-					/* A refused audio key is an account/catalog answer, not a
-					 * bug: show the friendly line, the hex code stays in the
-					 * log for debugging. */
-					if (strstr(native_last_error(), "no permite esta cancion"))
-						snprintf(now_artist, sizeof(now_artist), "%s",
-						         tr(S_PREMIUM_REQ));
-					else
-						snprintf(now_artist, sizeof(now_artist), "%s",
-						         native_last_error());
+					snprintf(now_artist, sizeof(now_artist), "%s",
+					         friendly_error(native_last_error()));
 					break;
 				default:
 					break;
 				}
 			}
+			{
+				static u64 busy_at;
+				char dl_title[8];
+				/* A closed lid must not sleep the remote either. */
+				const bool busy = cast_holds() || st == NATIVE_PLAYING ||
+				                  st == NATIVE_LOADING || end_pending ||
+				                  ring_used() > 0 ||
+				                  native_dl_queue_count() > 0 ||
+				                  native_dl_active(dl_title, sizeof(dl_title)) >= 0;
+				const u64 now_ms = osGetTime();
+				if (busy) {
+					busy_at = now_ms;
+					lid_mode_set(true);
+				} else if (now_ms - busy_at > LID_RELEASE_MS) {
+					lid_mode_set(false);
+				}
+			}
+			/* The speaker walks its own list while casting. */
+			if (end_pending && !cast_holds() &&
+			    ring_used() < (u32)SAMPLE_RATE * 4 * END_LEAD_S) {
+				end_pending = false;
+				track_ended();
+			}
 			if (st == NATIVE_PLAYING) {
 				snprintf(now_title, sizeof(now_title), "%s", native_now_title());
 				snprintf(now_artist, sizeof(now_artist), "%s", native_now_artist());
 				snprintf(now_album, sizeof(now_album), "%s", native_now_album());
-				now_pos = scrubbing ? now_pos : native_position();
+				if (!scrubbing) {
+					/* The decoder runs a ring ahead of the speaker. */
+					float queued = (float)ring_used() /
+					               (float)(SAMPLE_RATE * 4);
+					now_pos = native_position() - queued;
+					if (now_pos < 0.0f)
+						now_pos = 0.0f;
+				}
 				now_dur = native_duration();
 				server_playing = true;
 				// The cover follows the track; the art worker fetches it and
@@ -2295,17 +3270,20 @@ int main(int argc, char **argv)
 					art_present = false;
 					tint_target = 0;   // back to the skin until the cover lands
 				}
-			} else if (paused) {
+			} else if (paused && !cast_holds()) {
 				// The track ended or failed under a paused channel; do not
-				// carry the pause into whatever plays next.
+				// carry the pause into whatever plays next. While casting
+				// the pause is what keeps the console quiet.
 				paused = false;
 				ndspChnSetPaused(0, false);
 			}
 		}
 
 		if (lib.open) {
-			if (down & KEY_DUP && lib.sel > 0) lib.sel--;
-			if (down & KEY_DDOWN && lib.sel + 1 < lib.total) lib.sel++;
+			static nav_hold lib_hold;
+			const int step = nav_repeat(&lib_hold, down);
+			if (step && lib.total)
+				lib.sel = clamp_row(lib.sel + step, lib.total);
 			if (down & KEY_L) lib.sel = lib.sel >= 25 ? lib.sel - 25 : 0;
 			if ((down & KEY_R) && lib.total)
 				lib.sel = lib.sel + 25 < lib.total ? lib.sel + 25
@@ -2354,14 +3332,8 @@ int main(int argc, char **argv)
 				lib.open = false;
 			else if (g_touch.clicked == SL_BTN_BACK &&
 			         nat_view != NATIVE_PLAYLISTS) {
-				// Same trip the B button makes: up to the playlists.
-				nat_view = NATIVE_PLAYLISTS;
-				nat_arg[0] = '\0';
-				snprintf(nat_title, sizeof(nat_title), "%s", tr(S_LISTS));
-				lib.sel = 0;
-				native_fetch_cancel();   /* drop the old view's in-flight fetch */
-				lib.scroll = lib.velocity = 0.0f;
-				lib_reload = true;
+				// Same trip the B button makes.
+				lib_back();
 			}
 			else if (g_touch.clicked >= SL_ROW0)
 				activate_row(g_touch.clicked - SL_ROW0);
@@ -2389,23 +3361,37 @@ int main(int argc, char **argv)
 			}
 			if (down & KEY_B) {
 				if (nat_view != NATIVE_PLAYLISTS) {
-					nat_view = NATIVE_PLAYLISTS;
-					nat_arg[0] = '\0';
-					snprintf(nat_title, sizeof(nat_title), "%s", tr(S_LISTS));
-					lib.sel = 0;
-				native_fetch_cancel();   /* drop the old view's in-flight fetch */
-					lib.scroll = lib.velocity = 0.0f;
-					lib_reload = true;
+					lib_back();
 				} else {
 					lib.open = false;
 				}
 			}
 		}
 
+		if (vis_open && !lib_was_open && !lib.open && !lyr_open) {
+			/* B leaves the visualizer; X flips between its two looks. */
+			if (down & KEY_B) {
+				vis_open = false;
+				down &= ~KEY_B;
+			}
+			if (down & KEY_X) {
+				vis_mode = (vis_style)((vis_mode + 1) % VIS_STYLE_COUNT);
+				down &= ~KEY_X;
+			}
+		}
+		if (!lib_was_open && !lib.open && !lyr_open && (down & KEY_B)) {
+			lib.open = true;
+			lib_reload = true;
+		}
+
 		if (!lib.open && (down & KEY_A)) {
 			// A mirrors the on-screen disc: pause, not stop. The decoder
 			// sleeps when the ring is full, so resume costs nothing.
-			if (native_playback_state() == NATIVE_PLAYING) {
+			if (cast_lost_retry()) {
+			} else if (casting()) {
+				cast_paused = !cast_paused;
+				native_cast_command(cast_paused ? "pause" : "resume");
+			} else if (native_playback_state() == NATIVE_PLAYING) {
 				paused = !paused;
 				ndspChnSetPaused(0, paused);
 			}
@@ -2418,6 +3404,27 @@ int main(int argc, char **argv)
 
 		// D-pad left/right are the physical prev/next; shuffle may reroute
 		// them to a random row.
+		// While casting the speaker walks its own copy of the list, so
+		// the skips go to it; up/down step its volume (the slider only
+		// reaches this console's speakers).
+		if (casting() && !lib.open && !lyr_open) {
+			if (down & (KEY_DLEFT | KEY_DRIGHT | KEY_L | KEY_R)) {
+				native_cast_command((down & (KEY_DRIGHT | KEY_R))
+				                    ? "skip_next" : "skip_prev");
+				cast_changed = true;
+			}
+			if (down & (KEY_DUP | KEY_DDOWN)) {
+				native_cast_volume_step((down & KEY_DUP) ? +1 : -1);
+				char msg[96];
+				int v = native_cast_volume() + ((down & KEY_DUP) ? 5 : -5);
+				v = v < 0 ? 0 : v > 100 ? 100 : v;
+				snprintf(msg, sizeof(msg), tr(S_CAST_VOL),
+				         native_cast_name(), v);
+				toast_show(msg);
+			}
+			down &= ~(KEY_DLEFT | KEY_DRIGHT | KEY_L | KEY_R |
+			          KEY_DUP | KEY_DDOWN);
+		}
 		if (!lib.open && !lyr_open && (down & (KEY_DLEFT | KEY_DRIGHT))) {
 			const int dir = (down & KEY_DRIGHT) ? +1 : -1;
 			const int t = step_index(dir);
@@ -2433,6 +3440,121 @@ int main(int argc, char **argv)
 			const int t = step_index(dir);
 			if (t >= 0)
 				play_step(t);
+		}
+
+		{
+			/* A pick made while casting goes to the speaker; the state
+			 * shows in the title lines, where the song would be. */
+			static native_cast_status cast_seen = NATIVE_CAST_OFF;
+			if (cast_dirty) {
+				cast_dirty = false;
+				if (casting())
+					cast_start();
+			}
+			{
+				/* A speaker search just ended: say what it found and land
+				 * the row on a speaker again. */
+				static bool finding_seen = false;
+				const bool finding = native_cast_finding();
+				if (finding_seen && !finding) {
+					const int n = native_cast_found();
+					char msg[96];
+					if (n > 0)
+						snprintf(msg, sizeof(msg), tr(S_CAST_FOUND), n);
+					else
+						snprintf(msg, sizeof(msg), "%s", tr(S_CAST_NONE));
+					toast_show(msg);
+					if (native_cast_count() > 0)
+						cast_find_row = false;
+				}
+				finding_seen = finding;
+			}
+			if (cast_holds() && !paused) {   /* never both at once */
+				paused = true;
+				ndspChnSetPaused(0, true);
+			}
+			const native_cast_status cs = native_cast_state();
+			if (cs != cast_seen) {
+				char msg[160];
+				if (cs == NATIVE_CAST_ON) {
+					cast_was_on = true;
+					snprintf(msg, sizeof(msg), tr(S_CAST_ON),
+					         native_cast_name());
+				} else if (cs == NATIVE_CAST_FAILED && cast_was_on) {
+					/* It was playing: most likely a sleep or a lost
+					 * link, and the speaker may well still be on. */
+					cast_lost_at = osGetTime();
+					snprintf(msg, sizeof(msg), tr(S_CAST_LOST),
+					         native_cast_name());
+				} else if (cs == NATIVE_CAST_FAILED)
+					snprintf(msg, sizeof(msg), tr(S_CAST_FAILED),
+					         native_cast_name());
+				else
+					msg[0] = '\0';
+				if (msg[0])
+					toast_show(msg);
+				if (cs == NATIVE_CAST_FAILED)
+					native_log("CAST: UI shows failure: %s\n",
+					           native_cast_error());
+				cast_seen = cs;
+			}
+			/* The offer stays up until taken or stale, so it is still
+			 * there when the lid opens again. */
+			if (cast_lost_at && cs == NATIVE_CAST_FAILED &&
+			    osGetTime() - cast_lost_at <= CAST_LOST_MS) {
+				char msg[160];
+				snprintf(msg, sizeof(msg), tr(S_CAST_LOST),
+				         native_cast_name());
+				toast_show(msg);
+			} else {
+				cast_lost_at = 0;
+			}
+			if (cs == NATIVE_CAST_STARTING || cs == NATIVE_CAST_ON) {
+				if (!cast_changed && play_idx >= 0 && play_idx < play_count) {
+					snprintf(now_title, sizeof(now_title), "%s",
+					         play_labels[play_idx]);
+				} else if (cast_changed) {
+					snprintf(now_title, sizeof(now_title), "%s",
+					         play_ctx_title[0] ? play_ctx_title
+					                           : native_cast_name());
+				}
+				snprintf(now_artist, sizeof(now_artist),
+				         tr(cs == NATIVE_CAST_ON ? S_CAST_ON
+				                                 : S_CAST_STARTING),
+				         native_cast_name());
+			}
+		}
+		{
+			static u64 batt_at = 0;
+			const u64 now_ms = osGetTime();
+			if (!batt_at || now_ms - batt_at >= 5000) {
+				batt_at = now_ms;
+				u8 pct = 0, chg = 0;
+				if (R_SUCCEEDED(MCUHWC_GetBatteryLevel(&pct)))
+					batt_pct = pct > 100 ? 100 : pct;
+				if (R_SUCCEEDED(PTMU_GetBatteryChargeState(&chg)))
+					batt_charging = chg != 0;
+				/* The slope since a reference point: reset on the charger
+				 * or a rise, and trusted only once the percent has fallen
+				 * a little over a few minutes, so one tick cannot swing
+				 * it wildly. */
+				static int ref_pct = -1;
+				static u64 ref_ms = 0;
+				if (batt_pct >= 0) {
+					if (batt_charging || ref_pct < 0 || batt_pct > ref_pct) {
+						ref_pct = batt_pct;
+						ref_ms = now_ms;
+						batt_left_min = -1;
+					} else {
+						const int dropped = ref_pct - batt_pct;
+						const u64 span = now_ms - ref_ms;
+						if (dropped >= 2 && span >= 4 * 60 * 1000) {
+							const double ms_per_pct = (double)span / dropped;
+							batt_left_min = (int)(batt_pct * ms_per_pct / 60000.0);
+						}
+					}
+				}
+			}
 		}
 
 		// The overlay mirrors the hardware slider; any move pops it up.
@@ -2505,12 +3627,28 @@ int main(int argc, char **argv)
 		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
 		const float par = osGet3DSliderState() * 1.5f;
 		tint_cur = tint_step(tint_cur, tint_target ? tint_target : sk->top_bg);
+		if (vis_open) {
+			/* The slot NDSP is playing and where in it: the bars follow
+			 * the speaker, not the decoder running seconds ahead. */
+			int slot = -1;
+			if (!paused && !buffering)
+				for (int i = 0; i < WAVE_BUFFERS; i++)
+					if (waves[i].status == NDSP_WBUF_PLAYING)
+						slot = i;
+			vis_update(slot, ndspChnGetSamplePos(0));
+		}
 		C2D_TargetClear(top, 0xFF000000);
 		C2D_SceneBegin(top);
-		draw_top(sk, buffering, muted, -par);
+		if (vis_open)
+			draw_vis_top(sk, -par);
+		else
+			draw_top(sk, buffering, muted, -par);
 		C2D_TargetClear(topR, 0xFF000000);
 		C2D_SceneBegin(topR);
-		draw_top(sk, buffering, muted, par);
+		if (vis_open)
+			draw_vis_top(sk, par);
+		else
+			draw_top(sk, buffering, muted, par);
 		C2D_TargetClear(bottom, sk->bottom_bg);
 		C2D_SceneBegin(bottom);
 		draw_bottom(sk);
@@ -2519,9 +3657,24 @@ int main(int argc, char **argv)
 
 quit:
 	running = false;
-	threadJoin(lister, 2000000000LL);
-	threadJoin(snd, 2000000000LL);
-	threadJoin(art, 2000000000LL);
+	/* Everything starts stopping at once: the backend's threads, a list
+	 * fetch mid-flight, these three. Quitting used to stop them one by
+	 * one, each with seconds of grace. */
+	native_quit_signal();
+	native_fetch_cancel();
+	/* The lister and art threads can sit in a TLS read for a while; the
+	 * textures and buffers they use are freed below, so wait for them. */
+	{
+		const u64 t0 = osGetTime();
+		threadJoin(lister, 8000000000ULL);
+		const u64 t1 = osGetTime();
+		threadJoin(snd, 2000000000ULL);
+		threadJoin(art, 8000000000ULL);
+		const u64 t2 = osGetTime();
+		native_log("EXIT: lists %llu ms, covers %llu ms\n",
+		           (unsigned long long)(t1 - t0),
+		           (unsigned long long)(t2 - t1));
+	}
 	lid_mode_set(false);
 	native_exit();
 	C3D_TexDelete(&art_tex);
@@ -2532,7 +3685,9 @@ quit:
 	C3D_Fini();
 	ndspExit();
 	mcuHwcExit();
+	ptmuExit();
 	socExit();
+	aptUnhook(&apt_cookie);
 	gfxExit();
 	return 0;
 }

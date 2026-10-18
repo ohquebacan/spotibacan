@@ -112,7 +112,7 @@ static bool scan(const uint8_t *buf, size_t len, uint32_t field,
 		}
 		case 2: {
 			uint64_t n;
-			if (!get_varint(buf, len, &at, &n) || at + n > len)
+			if (!get_varint(buf, len, &at, &n) || n > len - at)
 				return false;
 			if (f == field && want_wire == 2) {
 				if (bytes_out) {
@@ -124,8 +124,8 @@ static bool scan(const uint8_t *buf, size_t len, uint32_t field,
 			at += (size_t)n;
 			break;
 		}
-		case 5: at += 4; break;
-		case 1: at += 8; break;
+		case 5: if (len - at < 4) return false; at += 4; break;
+		case 1: if (len - at < 8) return false; at += 8; break;
 		default: return false;     /* groups: not used by these messages */
 		}
 	}
