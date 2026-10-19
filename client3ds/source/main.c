@@ -217,41 +217,6 @@ static char play_subs[NATIVE_ROWS][40];
 static int play_count = 0;
 static int play_idx = -1;
 
-/* "Sonar despues": tracks held on the list, played before whatever the
- * snapshot would have played next. The snapshot index does not move when
- * the queue runs, so the list resumes where it left off afterwards. */
-#define PLAY_Q_MAX 20
-static char play_q[PLAY_Q_MAX][192];
-static char play_q_label[PLAY_Q_MAX][64];
-static char play_q_sub[PLAY_Q_MAX][40];
-static int play_qn = 0;
-
-static void queue_push(const native_row *r)
-{
-	if (play_qn >= PLAY_Q_MAX) {
-		native_log("COLA: llena, %s no entro\n", r->label);
-		return;
-	}
-	snprintf(play_q[play_qn], sizeof(play_q[0]), "%s", r->uri);
-	snprintf(play_q_label[play_qn], sizeof(play_q_label[0]), "%s", r->label);
-	snprintf(play_q_sub[play_qn], sizeof(play_q_sub[0]), "%s", r->sub);
-	play_qn++;
-	native_log("COLA: %s sonara despues (%d en cola)\n", r->label, play_qn);
-}
-
-static bool queue_shift(void)
-{
-	if (play_qn <= 0)
-		return false;
-	play_qn--;
-	memmove(play_q, play_q + 1, (size_t)play_qn * sizeof(play_q[0]));
-	memmove(play_q_label, play_q_label + 1,
-	        (size_t)play_qn * sizeof(play_q_label[0]));
-	memmove(play_q_sub, play_q_sub + 1,
-	        (size_t)play_qn * sizeof(play_q_sub[0]));
-	return true;
-}
-
 // The hardware slider owns the volume; the overlay only follows it. Mute
 // remains a local mix toggle, orthogonal to the slider.
 static int volume = 100;        // display value, mirrored from the slider
@@ -1121,25 +1086,10 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 		text_at(b, bx + bw, by + 8, 0.42f, sk->dim, C2D_AlignRight);
 	}
 
-	/* Up next: the strip under the art, free below the hinge line. A
-	 * non-empty queue wins -- those are the deliberate choices -- and
-	 * otherwise the snapshot's next rows show, when they are actually
-	 * predictable (shuffle picks at skip time and repeat-one replays this
-	 * one). */
-	if (play_qn > 0) {
-		float uy = 208.0f;
-		ui_text_tracked(text_buf, tr(S_IN_QUEUE),
-		                AX + par * 1.2f, ui_baseline(uy, TY_MICRO),
-		                TY_MICRO, 1.0f, sk->accent);
-		for (int i = 0; i < play_qn && i < 2; i++) {
-			char line[120];
-			snprintf(line, sizeof(line), "%s - %s", play_q_label[i],
-			         play_q_sub[i]);
-			text_fit(line, AX + 86.0f + par * 1.2f, uy - 6.0f + i * 14.0f,
-			         i == 0 ? 0.44f : 0.40f, i == 0 ? sk->dim : sk->meter,
-			         TOP_W - AX - 86.0f - 12.0f);
-		}
-	} else if (!shuffle_on && repeat_mode != 2 && play_idx >= 0) {
+	/* Up next: the strip under the art, free below the hinge line. It
+	 * shows the snapshot's next rows when they are actually predictable
+	 * (shuffle picks at skip time and repeat-one replays this one). */
+	if (!shuffle_on && repeat_mode != 2 && play_idx >= 0) {
 		int n1 = play_idx + 1;
 		if (n1 >= play_count)
 			n1 = (repeat_mode == 1 && play_count > 0) ? 0 : -1;
@@ -1192,34 +1142,39 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 			bat_charging = chg != 0;
 	}
 	{
-		const float bx = TOP_W - 30.0f, by = 12.0f;
+		/* Apple-style battery: the percentage lives inside the body, so
+		 * the status string carries only the download counter and the
+		 * clock. Body 24x12 with a 3px nub. */
+		const float bx = TOP_W - 34.0f, by = 10.0f;
 		const u32 frame = sk->dim;
 		const u32 fill = bat_charging ? sk->accent :
 		                 bat_level <= 20 ? sk->warm : sk->dim;
-		/* One right-aligned string left of the icon: optional download
-		 * counter, the clock, then the battery percentage (a "+" while
-		 * charging). Low battery tints the whole string warm. */
-		char right[56];
+		char right[48];
 		int len = 0;
 		int q_done = 0, q_total = 0;
 		native_dl_progress(&q_done, &q_total);
 		if (q_total > 0)
 			len += snprintf(right + len, sizeof(right) - len,
 			                "DL %d/%d  ", q_done, q_total);
-		len += snprintf(right + len, sizeof(right) - len, "%s  ", clock_txt);
-		len += snprintf(right + len, sizeof(right) - len, "%s%d%%",
-		                bat_charging ? "+" : "", bat_level);
+		len += snprintf(right + len, sizeof(right) - len, "%s", clock_txt);
 		const u32 stat_col = bat_level <= 20 && !bat_charging ? sk->warm
 		                                                      : sk->dim;
-		text_at(right, bx - 6.0f, by - 3.0f, 0.42f, stat_col,
+		text_at(right, bx - 6.0f, by - 1.0f, 0.42f, stat_col,
 		        C2D_AlignRight);
-		C2D_DrawRectSolid(bx, by, 0.2f, 16.0f, 8.0f, frame);
-		C2D_DrawRectSolid(bx + 16.0f, by + 2.0f, 0.2f, 2.0f, 4.0f, frame);
-		float w = 14.0f * (float)bat_level / 100.0f;
+		/* Frame, nub, then the level fill under the number. */
+		C2D_DrawRectSolid(bx, by, 0.2f, 24.0f, 12.0f, frame);
+		C2D_DrawRectSolid(bx + 24.0f, by + 3.0f, 0.2f, 3.0f, 6.0f, frame);
+		float w = 22.0f * (float)bat_level / 100.0f;
 		if (bat_charging)
-			w = 14.0f;
+			w = 22.0f;
 		if (w > 0.0f)
-			C2D_DrawRectSolid(bx + 1.0f, by + 1.0f, 0.3f, w, 6.0f, fill);
+			C2D_DrawRectSolid(bx + 1.0f, by + 1.0f, 0.3f, w, 10.0f, fill);
+		/* The number sits centred in the body, in light ink so it reads
+		 * over both the fill and the dark frame. */
+		char pct[8];
+		snprintf(pct, sizeof(pct), "%d", bat_level);
+		text_at(pct, bx + 12.0f, by + 9.5f, 0.32f, sk->text,
+		        C2D_AlignCenter);
 	}
 
 	// Last, above whatever the top screen shows: it only reports, and the
@@ -1626,20 +1581,24 @@ static void draw_pick(const Skin *sk)
 
 static void draw_settings(const Skin *sk)
 {
-	const u32 dim   = C2D_Color32(0x00, 0x00, 0x00, 0xA8);
-	const u32 bord  = C2D_Color32(0x38, 0x38, 0x38, 0xFF);
-	const u32 panel = C2D_Color32(0x1B, 0x1B, 0x1B, 0xFF);
+	const u32 scrim  = C2D_Color32(0x00, 0x00, 0x00, 0x98);
+	const u32 bord   = C2D_Color32(0x38, 0x38, 0x38, 0xFF);
+	const u32 panel  = C2D_Color32(0x1B, 0x1B, 0x1B, 0xFF);
+	const u32 hilite = C2D_Color32(0x2E, 0x2E, 0x2E, 0xFF);
 
-	C2D_DrawRectSolid(0.0f, 0.0f, 0.6f, BOT_W, SCR_H, dim);
-	const float px = 20.0f, py = 10.0f, pw = 280.0f, ph = 222.0f;
-	C2D_DrawRectSolid(px, py, 0.6f, pw, ph, bord);
-	C2D_DrawRectSolid(px + 1.0f, py + 1.0f, 0.6f, pw - 2.0f, ph - 2.0f,
-	                  panel);
+	C2D_DrawRectSolid(0.0f, 0.0f, 0.6f, BOT_W, SCR_H, scrim);
+	/* The same rounded card as the actions and picker windows. */
+	const float pw = 264.0f, px = (BOT_W - pw) / 2.0f;
+	const float ph = 217.0f;
+	const float py = (SCR_H - ph) / 2.0f;
+	round_panel(px, py, pw, ph, 8.0f, bord, panel);
 
 	ui_depth(0.7f);
-	ui_text(text_buf, tr(S_SETTINGS), px + 16.0f,
-	        ui_baseline(py + 8.0f, TY_ROW_NAME), TY_ROW_NAME, pw - 32.0f,
-	        sk->warm);
+	const float cx = px + 8.0f, cw = pw - 16.0f;
+	const float vx = cx + cw - 12.0f;   /* right edge of the value column */
+	ui_text(text_buf, tr(S_SETTINGS), cx,
+	        ui_baseline(py + 8.0f, TY_ROW_NAME), TY_ROW_NAME, cw - 96.0f,
+	        sk->text);
 	{
 		/* Battery and build, top right: "87%  v1.3", "+" while charging. */
 		char hdr[32] = "";
@@ -1658,8 +1617,8 @@ static void draw_settings(const Skin *sk)
 			const u32 col = batt_pct >= 0 && batt_pct <= 15 && !batt_charging
 			                ? sk->warm : sk->dim;   /* low: warn */
 			float vw = ui_text_width(text_buf, hdr, TY_ROW_SUB);
-			ui_text(text_buf, hdr, px + pw - 16.0f - vw,
-			        ui_baseline(py + 10.0f, TY_ROW_SUB), TY_ROW_SUB, vw, col);
+			ui_text(text_buf, hdr, cx + cw - vw,
+			        ui_baseline(py + 11.0f, TY_ROW_SUB), TY_ROW_SUB, vw, col);
 		}
 	}
 	if (settings_pending >= 0 || osGetTime() < settings_busy_until) {
@@ -1667,7 +1626,7 @@ static void draw_settings(const Skin *sk)
 		char dots[4] = "...";
 		dots[(osGetTime() / 200) % 3 + 1] = '\0';
 		float tw = ui_text_width(text_buf, tr(S_SETTINGS), TY_ROW_NAME);
-		ui_text(text_buf, dots, px + 28.0f + tw,
+		ui_text(text_buf, dots, cx + 12.0f + tw,
 		        ui_baseline(py + 8.0f, TY_ROW_NAME), TY_ROW_NAME, 32.0f,
 		        sk->accent);
 	}
@@ -1676,41 +1635,41 @@ static void draw_settings(const Skin *sk)
 		tr(S_LANGUAGE), tr(S_ACCENT), tr(S_DOWNLOADS), tr(S_QUALITY),
 		tr(S_EQ), tr(S_DL_LIST), tr(S_UNLINK), tr(S_QUIT), tr(S_BACK_MENU),
 	};
-	const float rh = 22.0f, ry = py + 26.0f;
+	const float rh = 19.0f, ry = py + 36.0f;
 	for (int i = 0; i < SETTINGS_ROWS; i++) {
-		const float y = ry + i * rh;
-		if (i == settings_sel)
-			C2D_DrawRectSolid(px + 6.0f, y - 3.0f, 0.65f, pw - 12.0f,
-			                  rh - 2.0f, sk->accent);
-		const u32 fg = i == settings_sel ? sk->on_accent : sk->text;
-		ui_text(text_buf, labels[i], px + 16.0f,
+		const float y = ry + (float)i * rh;
+		const bool sel = i == settings_sel ||
+		    (g_touch.down && g_touch.press_id == SET_ROW0 + i);
+		if (sel)
+			rounded_rect(cx, y + 1.0f, cw, rh - 2.0f, 6.0f, hilite);
+		const u32 fg = sk->text;
+		ui_text(text_buf, labels[i], cx + 12.0f,
 		        ui_baseline(y + 2.0f, TY_ROW_NAME), TY_ROW_NAME,
-		        pw - 100.0f, fg);
-		// The preference rows show their current value on the right.
+		        112.0f, fg);
+		/* The preference rows show their current value on the right;
+		 * long notes (target list, unlink warning) truncate into it. */
 		if (i == 0) {
 			const char *v = lang_get() == LANG_EN ? "English" : "Espanol";
 			float w = ui_text_width(text_buf, v, TY_ROW_SUB);
-			ui_text(text_buf, v, px + pw - 16.0f - w,
+			ui_text(text_buf, v, vx - w,
 			        ui_baseline(y + 5.0f, TY_ROW_SUB), TY_ROW_SUB, w, fg);
 		} else if (i == 1) {
 			float w = ui_text_width(text_buf, tr(ACCENT_NAMES[accent_idx]),
 			                        TY_ROW_SUB);
-			C2D_DrawRectSolid(px + pw - 16.0f - w - 18.0f, y + 5.0f,
-			                  0.65f, 12.0f, 12.0f,
+			C2D_DrawRectSolid(vx - w - 18.0f, y + 4.0f, 0.65f, 12.0f, 12.0f,
 			                  ACCENTS[accent_idx]);
-			ui_text(text_buf, tr(ACCENT_NAMES[accent_idx]),
-			        px + pw - 16.0f - w,
+			ui_text(text_buf, tr(ACCENT_NAMES[accent_idx]), vx - w,
 			        ui_baseline(y + 5.0f, TY_ROW_SUB), TY_ROW_SUB, w, fg);
 		} else if (i == 2) {
 			const char *v = downloads_on ? "ON" : "OFF";
 			float w = ui_text_width(text_buf, v, TY_ROW_SUB);
-			ui_text(text_buf, v, px + pw - 16.0f - w,
+			ui_text(text_buf, v, vx - w,
 			        ui_baseline(y + 5.0f, TY_ROW_SUB), TY_ROW_SUB, w,
 			        downloads_on ? fg : sk->dim);
 		} else if (i == 3) {
 			const char *v = sp_high_quality() ? "320 kbps" : "160 kbps";
 			float w = ui_text_width(text_buf, v, TY_ROW_SUB);
-			ui_text(text_buf, v, px + pw - 16.0f - w,
+			ui_text(text_buf, v, vx - w,
 			        ui_baseline(y + 5.0f, TY_ROW_SUB), TY_ROW_SUB, w,
 			        sp_high_quality() ? fg : sk->dim);
 		} else if (i == 4) {
@@ -1718,7 +1677,7 @@ static void draw_settings(const Skin *sk)
 				S_EQ_OFF, S_EQ_BASS, S_EQ_TREBLE, S_EQ_VOCAL, S_EQ_BOOST };
 			const char *v = tr(EQ_NAMES[eq_get()]);
 			float w = ui_text_width(text_buf, v, TY_ROW_SUB);
-			ui_text(text_buf, v, px + pw - 16.0f - w,
+			ui_text(text_buf, v, vx - w,
 			        ui_baseline(y + 5.0f, TY_ROW_SUB), TY_ROW_SUB, w,
 			        eq_get() != EQ_OFF ? fg : sk->dim);
 		} else if (i == 5) {
@@ -1729,18 +1688,28 @@ static void draw_settings(const Skin *sk)
 				         nat_count);
 			else
 				snprintf(note, sizeof(note), "%s", tr(S_DL_LIST_NOTE));
-			ui_text(text_buf, note, px + 16.0f,
-			        ui_baseline(y + 13.0f, TY_MICRO), TY_MICRO,
-			        pw - 32.0f, i == settings_sel ? fg : sk->dim);
+			float w = ui_text_width(text_buf, note, TY_ROW_SUB);
+			const float maxw = cw - 24.0f - 112.0f - 8.0f;
+			if (w > maxw)
+				w = maxw;
+			ui_text(text_buf, note, vx - w,
+			        ui_baseline(y + 5.0f, TY_ROW_SUB), TY_ROW_SUB, w,
+			        sel ? fg : sk->dim);
 		} else if (i == 6) {
-			ui_text(text_buf, tr(unlink_armed ? S_UNLINK_CONFIRM
-			                                  : S_UNLINKED_NOTE), px + 16.0f,
-			        ui_baseline(y + 14.0f, TY_MICRO), TY_MICRO,
-			        pw - 32.0f, i == settings_sel ? fg : sk->dim);
+			const char *v = tr(unlink_armed ? S_UNLINK_CONFIRM
+			                                : S_UNLINKED_NOTE);
+			float w = ui_text_width(text_buf, v, TY_ROW_SUB);
+			const float maxw = cw - 24.0f - 112.0f - 8.0f;
+			if (w > maxw)
+				w = maxw;
+			ui_text(text_buf, v, vx - w,
+			        ui_baseline(y + 5.0f, TY_ROW_SUB), TY_ROW_SUB, w,
+			        unlink_armed ? sk->warm : (sel ? fg : sk->dim));
 		}
-		tb_add(&g_tb, px + 6.0f, y - 3.0f, pw - 12.0f, rh - 2.0f,
-		       SET_ROW0 + i);
+		tb_add(&g_tb, cx, y, cw, rh, SET_ROW0 + i);
 	}
+	/* Taps on the scrim close; taps on a row still win. */
+	tb_add(&g_tb, 0.0f, 0.0f, BOT_W, SCR_H, ACT_CLOSE);
 	ui_depth(0.0f);
 }
 
@@ -2131,103 +2100,6 @@ static void draw_queue(const Skin *sk)
 	ui_depth(0.0f);
 }
 
-/* -------------------------------------------------- row context menu
- * Holding a row offers what used to crowd the player screen: play next,
- * go to the artist, go to the album. The row is snapshotted on open, so
- * a list refresh underneath cannot corrupt the choices. */
-static bool ctx_open = false;
-static native_row ctx_row;
-
-#define CTX_ROW_H 30.0f
-#define CTX_W     216.0f
-#define CTX_R     8.0f
-#define CTX_ROW0  0x7400
-#define CTX_CLOSE 0x73FF
-
-static int ctx_option_count(void)
-{
-	int n = 1;   /* "sonar despues" always: any track row can queue */
-	if (ctx_row.artist_uri[0])
-		n++;
-	if (ctx_row.album_uri[0])
-		n++;
-	return n;
-}
-
-/* Runs option `opt` of the open menu; the availability test mirrors
- * ctx_option_count so the index the touch map reported stays honest. */
-static void ctx_run(int opt)
-{
-	int n = 0;
-	if (opt == n++) {
-		queue_push(&ctx_row);
-		return;
-	}
-	if (ctx_row.artist_uri[0] && opt == n++) {
-		open_library_view(NATIVE_ARTIST, ctx_row.artist_uri, ctx_row.sub);
-		return;
-	}
-	if (ctx_row.album_uri[0] && opt == n++)
-		open_library_view(NATIVE_ALBUM, ctx_row.album_uri, tr(S_ALBUM));
-}
-
-static void draw_ctx_menu(const Skin *sk)
-{
-	const u32 scrim  = C2D_Color32(0x00, 0x00, 0x00, 0x98);
-	const u32 bord   = C2D_Color32(0x38, 0x38, 0x38, 0xFF);
-	const u32 panel  = C2D_Color32(0x1B, 0x1B, 0x1B, 0xFF);
-	const u32 cell   = C2D_Color32(0x24, 0x24, 0x24, 0xFF);
-	const u32 hilite = C2D_Color32(0x2E, 0x2E, 0x2E, 0xFF);
-
-	C2D_DrawRectSolid(0.0f, 0.0f, 0.6f, BOT_W, SCR_H, scrim);
-
-	const bool has_sub = ctx_row.sub[0] != '\0';
-	const float cell_h = has_sub ? 44.0f : 28.0f;
-	const int n = ctx_option_count();
-	const float ph = 16.0f + cell_h + 10.0f + (float)n * CTX_ROW_H + 12.0f;
-	const float px = (BOT_W - CTX_W) / 2.0f;
-	const float py = (SCR_H - ph) / 2.0f;
-	round_panel(px, py, CTX_W, ph, CTX_R, bord, panel);
-
-	/* Header cell: the held track's title (and artist when known) sits in
-	 * its own slightly lighter rounded cell so it reads as context, not as
-	 * another tappable option. */
-	const float cx = px + 8.0f;
-	const float cw = CTX_W - 16.0f;
-	rounded_rect(cx, py + 8.0f, cw, cell_h, 6.0f, cell);
-
-	/* The touch map answers the first rect holding the point: options are
-	 * registered before the full-screen closer so they win inside the
-	 * card, and a tap on the scrim falls through to CTX_CLOSE. */
-	ui_depth(0.7f);
-	float y = py + 8.0f + (has_sub ? 7.0f : 5.0f);
-	ui_text(text_buf, ctx_row.label, cx + 10.0f,
-	        ui_baseline(y, TY_ROW_NAME), TY_ROW_NAME, cw - 20.0f, sk->text);
-	if (has_sub)
-		ui_text(text_buf, ctx_row.sub, cx + 10.0f,
-		        ui_baseline(y + 16.0f, TY_ROW_SUB), TY_ROW_SUB,
-		        cw - 20.0f, sk->dim);
-	y = py + 8.0f + cell_h + 10.0f;
-
-	static const str_id opt_str[3] = { S_PLAY_NEXT, S_GO_ARTIST, S_GO_ALBUM };
-	const bool avail[3] = { true, ctx_row.artist_uri[0] != '\0',
-	                        ctx_row.album_uri[0] != '\0' };
-	for (int i = 0, opt = 0; i < 3; i++) {
-		if (!avail[i])
-			continue;
-		const float top = y + (float)opt * CTX_ROW_H;
-		if (g_touch.down && g_touch.press_id == CTX_ROW0 + opt)
-			rounded_rect(cx, top + 1.0f, cw, CTX_ROW_H - 2.0f, 6.0f, hilite);
-		ui_text(text_buf, tr(opt_str[i]), cx + 12.0f,
-		        ui_baseline(top + CTX_ROW_H / 2.0f, TY_ROW_NAME), TY_ROW_NAME,
-		        cw - 24.0f, sk->text);
-		tb_add(&g_tb, cx, top, cw, CTX_ROW_H, CTX_ROW0 + opt);
-		opt++;
-	}
-	tb_add(&g_tb, 0.0f, 0.0f, BOT_W, SCR_H, CTX_CLOSE);
-	ui_depth(0.0f);
-}
-
 static void draw_bottom(const Skin *sk)
 {
 	if (lyr_open) {
@@ -2324,9 +2196,6 @@ static void draw_bottom(const Skin *sk)
 	} else if (queue_open) {
 		tb_reset(&g_tb);
 		draw_queue(sk);
-	} else if (ctx_open) {
-		tb_reset(&g_tb);
-		draw_ctx_menu(sk);
 	}
 	/* A short note over everything, e.g. "Added to Road trip". */
 	if (toast[0] && osGetTime() < toast_until) {
@@ -2455,25 +2324,6 @@ static void play_index(int idx)
 	now_view = nat_view;
 	snprintf(now_arg, sizeof(now_arg), "%s",
 	         nat_view == NATIVE_SEARCH ? lib.query : nat_arg);
-}
-
-/* Consumes one queued track, if any, as the next play. Runs before every
- * other next-decision (repeat-one included): a queued track is the most
- * deliberate statement of what comes next. The snapshot index stays put,
- * so the list resumes where it left off once the queue drains. */
-static bool play_queued(void)
-{
-	if (play_qn <= 0)
-		return false;
-	char uri[192];
-	snprintf(uri, sizeof(uri), "%s", play_q[0]);
-	queue_shift();
-	native_play(uri);
-	buffering = true;
-	paused = false;
-	ndspChnSetPaused(0, false);
-	ring_clear();
-	return true;
 }
 
 /* Sends what the console would play now to the speaker: the list it came
@@ -2725,15 +2575,12 @@ static void open_library_view(native_view view, const char *arg,
 	lib_reload = true;
 }
 
-/* A track that finished on its own: a queued track comes first (that is
- * what "sonar despues" promised), then repeat-one replays, shuffle jumps
+/* A track that finished on its own: repeat-one replays, shuffle jumps
  * anywhere, repeat-all wraps at the end, and otherwise the next row plays.
  * Anything played off-list (the shelf) simply stops. */
 static void track_ended(void)
 {
-	if (play_queued())
-		return;
-auto_advance = true;
+	auto_advance = true;
 	if (repeat_mode == 2 && native_now_uri()[0]) {
 		/* Replay in place, keeping the list (and any queue) around it. */
 		if (play_idx >= 0 && play_idx < play_count)
@@ -3225,6 +3072,11 @@ int main(int argc, char **argv)
 			if (row == SETTINGS_ROWS - 1 || (down & (KEY_B | KEY_START))) {
 				settings_open = false;
 				unlink_armed = false;
+			} else if (g_touch.clicked == ACT_CLOSE) {
+				/* A tap on the scrim; row taps keep the menu open so
+				 * the new value of the row shows. */
+				settings_open = false;
+				unlink_armed = false;
 			}
 			down = 0;
 			g_touch.clicked = -1;
@@ -3342,17 +3194,13 @@ int main(int argc, char **argv)
 					settings_open = true;
 					settings_sel = 0;
 				} else {
-					/* An album or artist opens like a playlist would. */
-					nat_view = NATIVE_TRACKS;
-					snprintf(nat_arg, sizeof(nat_arg), "%s",
-					         row == 2 ? act.artist_uri : act.album_uri);
-					snprintf(nat_title, sizeof(nat_title), "%s",
-					         row == 2 ? act.artist : act.album);
-					lib.open = true;
-					lib.sel = 0;
-					native_fetch_cancel();
-					lib.scroll = lib.velocity = 0.0f;
-					lib_reload = true;
+					/* An album or artist opens like a playlist would,
+					 * on the nav stack: B comes back to the list the
+					 * menu was opened from. */
+					open_library_view(NATIVE_TRACKS,
+					                  row == 2 ? act.artist_uri
+					                           : act.album_uri,
+					                  row == 2 ? act.artist : act.album);
 				}
 			}
 			if (down & (KEY_B | KEY_START))
@@ -3410,19 +3258,6 @@ int main(int argc, char **argv)
 			down = 0;
 			g_touch.clicked = -1;
 			g_touch.long_pressed = -1;
-		} else if (ctx_open) {
-			/* An option runs its action; the scrim (or the usual keys)
-			 * just closes. The touch map holds only the options and
-			 * the full-screen closer, so a plain >= 0 test is safe. */
-			if (g_touch.clicked >= CTX_ROW0 && g_touch.clicked < CTX_ROW0 + 3)
-				ctx_run(g_touch.clicked - CTX_ROW0);
-			if (down & (KEY_B | KEY_START | KEY_SELECT))
-				ctx_open = false;
-			else if (g_touch.clicked >= 0)
-				ctx_open = false;
-			down = 0;
-			g_touch.clicked = -1;
-			g_touch.long_pressed = -1;
 		} else if (down & KEY_SELECT) {
 			help_open = true;
 			down = 0;
@@ -3456,8 +3291,7 @@ int main(int argc, char **argv)
 		 * flag the list or the seekbar below a window still reacts in
 		 * step with the menu's own cursor. */
 		const bool modal_open = actions_open || pick_open || settings_open ||
-		                        ctx_open || queue_open || srch_open ||
-		                        help_open;
+		                        queue_open || srch_open || help_open;
 
 		// A scrub is a drag, not a tap: the position follows the finger while
 		// held (a preview only -- the decoder keeps playing), and the seek
@@ -3507,16 +3341,14 @@ int main(int argc, char **argv)
 				break;
 			}
 			case BTN_P_NEXT: {
-				if (!play_queued()) {
-					if (casting()) {
-						native_cast_command("skip_next");
-						cast_changed = true;
-						break;
-					}
-					const int t = step_index(+1);
-					if (t >= 0)
-						play_step(t);
+				if (casting()) {
+					native_cast_command("skip_next");
+					cast_changed = true;
+					break;
 				}
+				const int t = step_index(+1);
+				if (t >= 0)
+					play_step(t);
 				break;
 			}
 			case BTN_P_SHUFFLE:
@@ -3720,20 +3552,6 @@ int main(int argc, char **argv)
 			else if (g_touch.clicked >= SL_ROW0)
 				activate_row(g_touch.clicked - SL_ROW0);
 
-			/* Holding a row opens its context menu -- play next, go to
-			 * the artist or the album. A tap keeps meaning "play now";
-			 * the long press cancels the tap itself, so nothing plays
-			 * by accident. */
-			if (g_touch.long_pressed >= SL_ROW0) {
-				int extra = (nat_view == NATIVE_PLAYLISTS) ? 2 : 0;
-				int idx = g_touch.long_pressed - SL_ROW0 - extra;
-				if (idx >= 0 && idx < nat_count &&
-				    !nat_rows[idx].is_playlist) {
-					ctx_row = nat_rows[idx];
-					ctx_open = true;
-				}
-			}
-
 			if (down & KEY_A)
 				activate_row(lib.sel);
 			if (down & KEY_Y)
@@ -3803,13 +3621,9 @@ int main(int argc, char **argv)
 		}
 		if (!lib.open && !lyr_open && (down & (KEY_DLEFT | KEY_DRIGHT))) {
 			const int dir = (down & KEY_DRIGHT) ? +1 : -1;
-			if (dir > 0 && play_queued())
-				;
-			else {
-				const int t = step_index(dir);
-				if (t >= 0)
-					play_step(t);
-			}
+			const int t = step_index(dir);
+			if (t >= 0)
+				play_step(t);
 		}
 
 		// L/R are the physical prev/next: with the lid closed they are the
@@ -3817,13 +3631,9 @@ int main(int argc, char **argv)
 		// so these keys are free for the job that actually needs them.
 		if (!lib.open && !lyr_open && (down & (KEY_L | KEY_R))) {
 			const int dir = (down & KEY_R) ? +1 : -1;
-			if (dir > 0 && play_queued())
-				;
-			else {
-				const int t = step_index(dir);
-				if (t >= 0)
-					play_step(t);
-			}
+			const int t = step_index(dir);
+			if (t >= 0)
+				play_step(t);
 		}
 
 		{
