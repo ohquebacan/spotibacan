@@ -1085,33 +1085,6 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 		C2D_DrawRectangle(0.0f, y0, 0.0f, TOP_W, y1 - y0, c0, c0, c1, c1);
 	}
 
-	/* Status line in what used to be an empty band: where the music comes
-	 * from on the left; queue, battery and clock on the right. Flat (no
-	 * parallax), like a system bar. */
-	{
-		const float sy = 7.0f;
-		char right[48] = "";
-		int q_done = 0, q_total = 0;
-		native_dl_progress(&q_done, &q_total);
-		if (q_total > 0)
-			snprintf(right, sizeof(right), "DL %d/%d   ", q_done, q_total);
-		if (batt_pct >= 0)
-			snprintf(right + strlen(right), sizeof(right) - strlen(right),
-			         "%s%d%%   ", batt_charging ? "+" : "", batt_pct);
-		time_t now_t = time(NULL);
-		struct tm *lt = localtime(&now_t);
-		if (lt)
-			snprintf(right + strlen(right), sizeof(right) - strlen(right),
-			         "%02d:%02d", lt->tm_hour, lt->tm_min);
-		text_at(right, TOP_W - 14.0f, sy, 0.44f,
-		        batt_pct >= 0 && batt_pct <= 15 && !batt_charging ? sk->warm
-		                                                          : sk->dim,
-		        C2D_AlignRight);
-		const char *ctx = play_idx >= 0 && play_ctx_title[0] ? play_ctx_title
-		                                                     : "SpotiBacan";
-		text_fit(ctx, 20.0f, sy, 0.44f, sk->dim, TOP_W - 20.0f - 150.0f);
-	}
-
 	// Art on the left with a real margin, text beside it, and nothing else.
 	// The text column is measured, so a long title stops at the edge instead
 	// of running off it. Its rows line up with the cover's top and bottom.
@@ -1133,12 +1106,12 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 	                    muted     ? tr(S_STATE_MUTED) : tr(S_STATE_PLAYING);
 	C2D_DrawCircleSolid(TX + 5 + par * 0.8f, AY + 106, 0.1f, 4,
 	                    buffering ? sk->warm : sk->accent);
-	text_at(state, TX + 18 + par * 0.8f, AY + 97, 0.46f, sk->dim, 0);
+	text_at(state, TX + 18 + par * 0.8f, AY + 103, 0.46f, sk->dim, 0);
 
 	if (now_dur > 1.0f) {
 		float done = now_pos / now_dur;
 		if (done > 1.0f) done = 1.0f;
-		float bx = TX + par * 0.6f, by = AY + ART - 22.0f, bw = TW;
+		float bx = TX + par * 0.6f, by = AY + 140, bw = TW;
 		C2D_DrawRectSolid(bx, by, 0.0f, bw, 3, sk->meter);
 		C2D_DrawRectSolid(bx, by, 0.1f, bw * done, 3, sk->accent);
 		char a[12], b[12];
@@ -1171,7 +1144,7 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 		if (n1 >= play_count)
 			n1 = (repeat_mode == 1 && play_count > 0) ? 0 : -1;
 		if (n1 >= 0) {
-			float uy = 210.0f;
+			float uy = 208.0f;
 			ui_text_tracked(text_buf, tr(S_UPNEXT),
 			                AX + par * 1.2f, ui_baseline(uy, TY_MICRO),
 			                TY_MICRO, 1.0f, sk->meter);
@@ -1223,6 +1196,16 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 		const u32 frame = sk->dim;
 		const u32 fill = bat_charging ? sk->accent :
 		                 bat_level <= 20 ? sk->warm : sk->dim;
+		/* The download counter keeps it company on the left, same baseline
+		 * as the clock and only while something is actually queueing. */
+		int q_done = 0, q_total = 0;
+		native_dl_progress(&q_done, &q_total);
+		if (q_total > 0) {
+			char dl_txt[24];
+			snprintf(dl_txt, sizeof(dl_txt), "DL %d/%d", q_done, q_total);
+			text_at(dl_txt, bx - 40.0f, by - 3.0f, 0.42f, sk->dim,
+			        C2D_AlignRight);
+		}
 		C2D_DrawRectSolid(bx, by, 0.2f, 16.0f, 8.0f, frame);
 		C2D_DrawRectSolid(bx + 16.0f, by + 2.0f, 0.2f, 2.0f, 4.0f, frame);
 		float w = 14.0f * (float)bat_level / 100.0f;
@@ -1495,17 +1478,24 @@ static bool actions_capture(void)
 	return act.artist_uri[0] || act.album_uri[0] || native_now_uri()[0];
 }
 
+/* The scrim tap that closes the actions window and its playlist picker.
+ * Sits just below ACT_ROW0 so the row ids keep their range. */
+#define ACT_CLOSE 0x71FF
+
+/* Defined further down with the other ui helpers; the windows above them
+ * draw before that point. */
+static void rounded_rect(float x, float y, float w, float h, float r, u32 clr);
+static void round_panel(float x, float y, float w, float h, float r,
+                        u32 border, u32 panel);
+
 static void draw_actions(const Skin *sk)
 {
-	const u32 dim   = C2D_Color32(0x00, 0x00, 0x00, 0xA8);
-	const u32 bord  = C2D_Color32(0x38, 0x38, 0x38, 0xFF);
-	const u32 panel = C2D_Color32(0x1B, 0x1B, 0x1B, 0xFF);
-	C2D_DrawRectSolid(0.0f, 0.0f, 0.6f, BOT_W, SCR_H, dim);
-	const float px = 20.0f, py = 4.0f, pw = 280.0f, ph = 232.0f;
-	C2D_DrawRectSolid(px, py, 0.6f, pw, ph, bord);
-	C2D_DrawRectSolid(px + 1.0f, py + 1.0f, 0.6f, pw - 2.0f, ph - 2.0f, panel);
+	const u32 scrim  = C2D_Color32(0x00, 0x00, 0x00, 0x98);
+	const u32 bord   = C2D_Color32(0x38, 0x38, 0x38, 0xFF);
+	const u32 panel  = C2D_Color32(0x1B, 0x1B, 0x1B, 0xFF);
+	const u32 hilite = C2D_Color32(0x2E, 0x2E, 0x2E, 0xFF);
+	C2D_DrawRectSolid(0.0f, 0.0f, 0.6f, BOT_W, SCR_H, scrim);
 
-	ui_depth(0.7f);
 	char cast_label[80];
 	const bool find_row = cast_find_row || native_cast_count() == 0;
 	if (casting())
@@ -1535,25 +1525,38 @@ static void draw_actions(const Skin *sk)
 	const char *subs[ACT_ROWS] = { act.has_row ? act.row.label : "", "",
 	                               act.artist, act.album, "", "", "",
 	                               cast_sub, "" };
-	/* Nine rows of 25px fill the sheet; a sub line sits right under. */
-	const float rh = 25.0f, ry = py + 8.0f;
+	/* The same rounded card as the row context menu: nine rows, a grey
+	 * pill on the selection, the sub line under the selected row. */
+	const float pw = 264.0f, px = (BOT_W - pw) / 2.0f;
+	const float rh = 22.0f;
+	const float ph = 16.0f + (float)ACT_ROWS * rh + 12.0f;
+	const float py = (SCR_H - ph) / 2.0f;
+	round_panel(px, py, pw, ph, 8.0f, bord, panel);
+
+	ui_depth(0.7f);
+	const float cx = px + 8.0f, cw = pw - 16.0f;
+	const float ry = py + 8.0f;
 	for (int i = 0; i < ACT_ROWS; i++) {
-		const float y = ry + i * rh;
+		const float y = ry + (float)i * rh;
 		const bool on = action_enabled(i);
-		if (i == actions_sel)
-			C2D_DrawRectSolid(px + 6.0f, y - 3.0f, 0.65f, pw - 12.0f,
-			                  rh - 2.0f, sk->accent);
-		const u32 fg = i == actions_sel ? sk->on_accent
-		               : (on ? sk->text : sk->dim);
-		ui_text(text_buf, labels[i], px + 16.0f,
-		        ui_baseline(y, TY_ROW_NAME), TY_ROW_NAME, pw - 32.0f, fg);
-		if (subs[i][0])
-			ui_text(text_buf, subs[i], px + 16.0f,
-			        ui_baseline(y + 13.0f, TY_ROW_SUB), TY_ROW_SUB,
-			        pw - 32.0f, i == actions_sel ? fg : sk->dim);
-		tb_add(&g_tb, px + 6.0f, y - 3.0f, pw - 12.0f, rh - 2.0f,
-		       ACT_ROW0 + i);
+		const bool sel = i == actions_sel ||
+		    (g_touch.down && g_touch.press_id == ACT_ROW0 + i);
+		if (sel)
+			rounded_rect(cx, y + 1.0f, cw, rh - 2.0f, 6.0f, hilite);
+		const bool show_sub = subs[i][0] && i == actions_sel;
+		const u32 fg = on ? sk->text : sk->dim;
+		ui_text(text_buf, labels[i], cx + 12.0f,
+		        ui_baseline(y + (show_sub ? 8.0f : rh / 2.0f), TY_ROW_NAME),
+		        TY_ROW_NAME, cw - 24.0f, fg);
+		if (show_sub)
+			ui_text(text_buf, subs[i], cx + 12.0f,
+			        ui_baseline(y + 19.0f, TY_ROW_SUB), TY_ROW_SUB,
+			        cw - 24.0f, sk->dim);
+		tb_add(&g_tb, cx, y, cw, rh, ACT_ROW0 + i);
 	}
+	/* The full-screen closer registers last: taps on the scrim fall
+	 * through to it, taps on a row still win. */
+	tb_add(&g_tb, 0.0f, 0.0f, BOT_W, SCR_H, ACT_CLOSE);
 	ui_depth(0.0f);
 }
 
@@ -1562,33 +1565,41 @@ static void draw_actions(const Skin *sk)
 #define PICK_VIS 7
 static void draw_pick(const Skin *sk)
 {
-	const u32 dim   = C2D_Color32(0x00, 0x00, 0x00, 0xA8);
-	const u32 bord  = C2D_Color32(0x38, 0x38, 0x38, 0xFF);
-	const u32 panel = C2D_Color32(0x1B, 0x1B, 0x1B, 0xFF);
-	C2D_DrawRectSolid(0.0f, 0.0f, 0.6f, BOT_W, SCR_H, dim);
-	const float px = 12.0f, py = 6.0f, pw = 296.0f, ph = 228.0f;
-	C2D_DrawRectSolid(px, py, 0.6f, pw, ph, bord);
-	C2D_DrawRectSolid(px + 1.0f, py + 1.0f, 0.6f, pw - 2.0f, ph - 2.0f, panel);
+	const u32 scrim  = C2D_Color32(0x00, 0x00, 0x00, 0x98);
+	const u32 bord   = C2D_Color32(0x38, 0x38, 0x38, 0xFF);
+	const u32 panel  = C2D_Color32(0x1B, 0x1B, 0x1B, 0xFF);
+	const u32 hilite = C2D_Color32(0x2E, 0x2E, 0x2E, 0xFF);
+	C2D_DrawRectSolid(0.0f, 0.0f, 0.6f, BOT_W, SCR_H, scrim);
+
+	const float pw = 264.0f, px = (BOT_W - pw) / 2.0f;
+	const float rh = 26.0f;
+	const float ph = 34.0f + (float)PICK_VIS * rh + 12.0f;
+	const float py = (SCR_H - ph) / 2.0f;
+	round_panel(px, py, pw, ph, 8.0f, bord, panel);
+
 	ui_depth(0.7f);
-	ui_text(text_buf, tr(S_ADD_TO_PL), px + 12.0f,
-	        ui_baseline(py + 6.0f, TY_ROW_NAME), TY_ROW_NAME, pw - 24.0f, sk->warm);
+	ui_text(text_buf, tr(S_ADD_TO_PL), px + 14.0f,
+	        ui_baseline(py + 8.0f, TY_ROW_NAME), TY_ROW_NAME, pw - 28.0f,
+	        sk->text);
 	int first = pick_sel - PICK_VIS / 2;
 	if (first > pick_n - PICK_VIS)
 		first = pick_n - PICK_VIS;
 	if (first < 0)
 		first = 0;
-	const float rh = 28.0f, ry = py + 30.0f;
+	const float cx = px + 8.0f, cw = pw - 16.0f;
+	const float ry = py + 32.0f;
 	for (int i = 0; i < PICK_VIS && first + i < pick_n; i++) {
 		const int idx = first + i;
-		const float y = ry + i * rh;
-		if (idx == pick_sel)
-			C2D_DrawRectSolid(px + 6.0f, y - 3.0f, 0.65f, pw - 12.0f, rh - 2.0f,
-			                  sk->accent);
-		ui_text(text_buf, pick_rows[idx].label, px + 14.0f,
-		        ui_baseline(y + 3.0f, TY_ROW_NAME), TY_ROW_NAME, pw - 28.0f,
-		        idx == pick_sel ? sk->on_accent : sk->text);
-		tb_add(&g_tb, px + 6.0f, y - 3.0f, pw - 12.0f, rh - 2.0f, ACT_ROW0 + 0x40 + i);
+		const float y = ry + (float)i * rh;
+		if (idx == pick_sel ||
+		    (g_touch.down && g_touch.press_id == ACT_ROW0 + 0x40 + i))
+			rounded_rect(cx, y + 1.0f, cw, rh - 2.0f, 6.0f, hilite);
+		ui_text(text_buf, pick_rows[idx].label, cx + 12.0f,
+		        ui_baseline(y + rh / 2.0f, TY_ROW_NAME), TY_ROW_NAME,
+		        cw - 24.0f, sk->text);
+		tb_add(&g_tb, cx, y, cw, rh, ACT_ROW0 + 0x40 + i);
 	}
+	tb_add(&g_tb, 0.0f, 0.0f, BOT_W, SCR_H, ACT_CLOSE);
 	ui_depth(0.0f);
 }
 
@@ -3250,6 +3261,8 @@ int main(int argc, char **argv)
 			}
 			if (down & (KEY_B | KEY_START))
 				pick_open = false;
+			else if (g_touch.clicked >= 0)
+				pick_open = false;   /* the scrim (ACT_CLOSE) and nothing else */
 			down = 0;
 			g_touch.clicked = -1;
 			g_touch.long_pressed = -1;
@@ -3341,6 +3354,8 @@ int main(int argc, char **argv)
 			}
 			if (down & (KEY_B | KEY_START))
 				actions_open = false;
+			else if (g_touch.clicked >= 0)
+				actions_open = false;   /* the scrim (ACT_CLOSE) and nothing else */
 			down = 0;
 			g_touch.clicked = -1;
 			g_touch.long_pressed = -1;
@@ -3408,9 +3423,11 @@ int main(int argc, char **argv)
 		} else if (down & KEY_SELECT) {
 			help_open = true;
 			down = 0;
-		} else if (down & KEY_START) {
-			/* With a Spotify track playing, START offers its artist and
-			 * album first; otherwise it is straight to the settings. */
+		} else if (down & KEY_X) {
+			/* X opens the actions menu: play next, add to playlist,
+			 * artist, album, radio, visualizer, delete download,
+			 * play on a speaker, settings. With nothing it can act
+			 * on, it falls straight through to the settings. */
 			if (actions_capture()) {
 				actions_open = true;
 				act_delete_armed = false;
@@ -3701,24 +3718,8 @@ int main(int argc, char **argv)
 				activate_row(lib.sel);
 			if (down & KEY_Y)
 				open_search = true;
-			if ((down & KEY_X) && lib.total && !native_offline()) {
-				// X on a track seeds a radio from it (a network view).
-				int extra = (nat_view == NATIVE_PLAYLISTS) ? 2 : 0;
-				int idx = lib.sel - extra;
-				if (idx >= 0 && idx < nat_count &&
-				    !nat_rows[idx].is_playlist &&
-				    strncmp(nat_rows[idx].uri, "file:", 5) != 0) {
-					nav_push();
-					snprintf(nat_arg, sizeof(nat_arg), "%s",
-					         nat_rows[idx].uri);
-					nat_view = NATIVE_RADIO;
-					snprintf(nat_title, sizeof(nat_title), "%s", tr(S_RADIO));
-					lib.sel = 0;
-				native_fetch_cancel();   /* drop the old view's in-flight fetch */
-					lib.scroll = lib.velocity = 0.0f;
-					lib_reload = true;
-				}
-			}
+			/* X aqui ya no siembra la radio: abre el menu de acciones
+			 * (la radio es una de sus filas). */
 			if (down & KEY_B)
 				library_back();
 		}
