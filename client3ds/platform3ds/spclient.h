@@ -37,10 +37,6 @@ typedef struct {
 	char    name[128];
 	char    artist[128];
 	char    album[128];
-	/* Where "go to artist / go to album" navigates: built from the gids the
-	 * metadata carries. Empty when the response had none. */
-	char    album_uri[40];
-	char    artist_uri[40];
 	/* Cover art as full i.scdn.co URLs: small (64px) for list rows, large
 	 * (300px) for the now-playing screen. Empty when the album carries no
 	 * images. */

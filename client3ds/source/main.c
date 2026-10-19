@@ -2444,7 +2444,7 @@ static bool play_queued(void)
 	return true;
 }
 
-* Sends what the console would play now to the speaker: the list it came
+/* Sends what the console would play now to the speaker: the list it came
  * from as the context (so the speaker goes on through it by itself), from
  * that song. A saved file goes alone; the cast thread looks up its id. */
 static bool cast_start(void)

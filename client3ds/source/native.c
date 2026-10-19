@@ -680,8 +680,6 @@ native_state native_playback_state(void) { return g.state; }
 const char *native_now_title(void)  { return g.title; }
 const char *native_now_artist(void) { return g.artist; }
 const char *native_now_album(void)  { return g.album; }
-const char *native_now_album_uri(void)  { return g.album_uri; }
-const char *native_now_artist_uri(void) { return g.artist_uri; }
 /* The URI last asked for, so the lyrics view can tell its document belongs
  * to what is playing. Empty before the first play. */
 const char *native_now_uri(void)    { return g.want; }
@@ -1668,7 +1666,7 @@ static void player_thread(void *arg)
 				}
 				g.album[0] = '\0';
 				g.art[0] = '\0';
-				g.album_uri[0] = g.artist_uri[0] = '\0';
+				g.now_album_uri[0] = g.now_artist_uri[0] = '\0';
 				play_local(uri + 5);
 				play_ended_at = osGetTime();
 				if (g.state == NATIVE_PLAYING)
@@ -1752,10 +1750,6 @@ static void player_thread(void *arg)
 			snprintf(g.now_artist_uri, sizeof(g.now_artist_uri), "%s",
 			         job->ts.meta.artist_uri);
 			snprintf(g.art, sizeof(g.art), "%s", job->ts.meta.art_large);
-			snprintf(g.album_uri, sizeof(g.album_uri), "%s",
-			         job->ts.meta.album_uri);
-			snprintf(g.artist_uri, sizeof(g.artist_uri), "%s",
-			         job->ts.meta.artist_uri);
 
 			/* The download runs beside the decoder. An arm that landed
 			 * while the metadata fetch was still running has no job to
