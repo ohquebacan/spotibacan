@@ -10,10 +10,13 @@
 #ifndef NATIVE_H
 #define NATIVE_H
 
+#include <3ds/types.h>
+#include <3ds/thread.h>
+
 #include <stdbool.h>
 #include <stddef.h>
 
-#define NATIVE_ROWS 512         /* a whole list: liked songs easily pass 300 */
+#define NATIVE_ROWS 1024        /* a whole list: liked songs pass 512 */
 
 typedef enum {
 	NATIVE_PLAYLISTS,           /* the account's playlist folder */
@@ -27,12 +30,17 @@ typedef enum {
 } native_view;
 
 typedef struct {
-	char label[64];             /* what the row shows */
-	char sub[40];               /* artist, or the track count */
+	/* Wide enough for the whole names a saved file is named after
+	 * (download_name keeps up to 60 bytes of artist, 127 of title): cut
+	 * shorter, a row no longer finds its own file on the card. */
+	char label[128];            /* what the row shows */
+	char sub[64];               /* artist, or the track count */
 	char uri[192];              /* spotify:track:... or file:<name>.ogg */
 	char art[200];               /* 64px cover URL, empty when there is none */
-	char artist_uri[40];        /* spotify:artist:... for the context menu */
-	char album_uri[40];         /* spotify:album:... for the context menu */
+	/* For "go to artist / album" on a selected row; empty when unknown. */
+	char album[48];
+	char artist_uri[40];
+	char album_uri[40];
 	bool is_playlist;
 } native_row;
 
@@ -110,6 +118,10 @@ native_state native_playback_state(void);
 const char  *native_now_title(void);
 const char  *native_now_artist(void);
 const char  *native_now_album(void);
+/* spotify:album:/spotify:artist: of the playing track, "" when unknown
+ * (local files, or before the first play). */
+const char  *native_now_album_uri(void);
+const char  *native_now_artist_uri(void);
 /* 300px cover of the playing track, or "" -- the UI keeps its placeholder
  * until this has something to say. */
 const char  *native_now_art(void);
@@ -137,6 +149,10 @@ void         native_set_downloads(bool on);
  * once its background download completes; armed state for the icon. */
 void         native_save_current(void);
 bool         native_save_armed(void);
+/* The playing track's file is still downloading: extras should wait. */
+bool         native_stream_busy(void);
+/* threadCreate on the system core when available, else the app core. */
+Thread       native_spawn_worker(ThreadFunc fn, void *arg, size_t stack, int prio);
 /* True once the playing track's .ogg exists on the card (cached per URI). */
 bool         native_current_saved(void);
 
@@ -144,7 +160,36 @@ bool         native_current_saved(void);
 /* An armed download that gets cut short (its background slot is taken by a
  * newer one) is queued here instead of dying: the player drains the queue
  * one track at a time whenever no other download is using the link. */
-#define NATIVE_DLQ_MAX 12
+#define NATIVE_DLQ_MAX 1024     /* a whole list: rows cap at NATIVE_ROWS */
+
+/* The player lets the queue start a download (a few blocking seconds) only
+ * while the ring has less than this much room left, i.e. is nearly full. */
+#define NATIVE_PUMP_FREE_MAX (96 * 1024)
+/* ...and only with this many seconds of the song still to decode: a start
+ * that runs long must not hold up the next track. */
+#define NATIVE_PUMP_MIN_LEFT_S 45u
+
+/* native_last_error() when Spotify withholds audio keys from the account
+ * (librespot#1649). The UI matches it to show a translated explanation. */
+#define NATIVE_ERR_KEY_BLOCKED "key-blocked: Spotify refuses audio keys for this account"
+
+/* Queues every track row of a list for download; returns how many were
+ * added (rows already queued or past NATIVE_DLQ_MAX are skipped). */
+int  native_dl_enqueue_list(const native_row *rows, int n, const char *title);
+/* Drops everything still waiting (the running download finishes). */
+void native_dl_clear(void);
+/* Removes a saved song (file:<name>.ogg) and its cover from the card. */
+bool native_delete_download(const char *file_uri);
+/* Appends a track to one of the account's playlists (network: call it off
+ * the render thread). 0 on success, else err says why. */
+int  native_playlist_add(const char *playlist_uri, const char *track_uri,
+                         char *err, size_t errlen);
+/* The playlist list as last fetched (playlists.txt), for pickers. */
+int  native_playlists_cached(native_row *rows, int max);
+/* Finished (incl. failed) and total for the current batch. */
+void native_dl_progress(int *done, int *total);
+/* native_dl_active() while the finished file is being written to SD. */
+#define NATIVE_DL_SAVING 101
 
 /* Queue length for the badge, and entry i's title for the popup
  * (0 = the oldest). Returns false when i is out of range. */
@@ -153,6 +198,48 @@ bool native_dl_queue_entry(int i, char *title, size_t titlelen);
 /* The download the queue is running right now: 0-100, or -1 when idle.
  * title_out gets its name when active. */
 int  native_dl_active(char *title_out, size_t titlelen);
+/* Casting to the one speaker named in cast.txt. The calls only post a
+ * request; a worker does the network. Starting wakes the speaker and signs
+ * it in to Spotify, then plays `context_uri` from `track_uri` (may be "")
+ * at `pos_ms`; after that the console is a remote for it. */
+typedef enum {
+	NATIVE_CAST_OFF = 0,
+	NATIVE_CAST_STARTING,
+	NATIVE_CAST_ON,
+	NATIVE_CAST_FAILED,
+} native_cast_status;
+bool               native_cast_configured(void);
+const char        *native_cast_name(void);
+/* How many speakers cast.txt lists; native_cast_pick(i) makes speaker i
+ * (0-based) the one "Play on" uses, remembered, only while not casting. */
+int                native_cast_count(void);
+int                native_cast_current(void);
+void               native_cast_pick(int i);
+/* Looks for Google Cast speakers on the wifi (about 3 s, in the
+ * background) and adds them to cast.txt. native_cast_found() is how many
+ * answered the last time, -1 if it failed. */
+void               native_cast_find(void);
+bool               native_cast_finding(void);
+int                native_cast_found(void);
+native_cast_status native_cast_state(void);
+const char        *native_cast_error(void);
+void native_cast_play(const char *context_uri, const char *track_uri,
+                      long pos_ms);
+/* "pause", "resume", "skip_next" or "skip_prev". */
+void native_cast_command(const char *endpoint);
+/* One 5 % step up (+1) or down (-1); native_cast_volume() is 0..100. */
+void native_cast_volume_step(int dir);
+int  native_cast_volume(void);
+/* Starts the shutdown of every backend thread without waiting for it;
+ * native_exit() then joins them. */
+void native_quit_signal(void);
+/* The console woke from sleep: open links are dead, rebuild them. */
+void native_on_wake(void);
+/* After a failure: resumes the speaker, or replays the last list on it. */
+void native_cast_reconnect(void);
+/* Pauses the speaker and leaves cast mode. */
+void native_cast_end(void);
+
 /* Appends a line to the same native.log the backend writes; for UI-side
  * failures that would otherwise leave no trace (a stuck view, a dead tap). */
 void         native_log(const char *fmt, ...);

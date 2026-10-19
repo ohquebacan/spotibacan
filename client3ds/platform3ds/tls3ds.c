@@ -51,7 +51,18 @@ struct tls_conn {
 	int                      fd;
 	int                      timeout_ms;
 	char                     host[128];
+	/* Where a connection's time goes: waiting in poll() for the network,
+	 * versus everything else (decrypting, parsing). Logged on close. */
+	u64                      opened_ms;
+	u64                      wait_ms;
+	size_t                   bytes_in;
 };
+
+#define TLS_CONNECT_TIMEOUT_MS 8000
+
+static void (*s_logger)(const char *line);
+
+void tls_set_logger(void (*logger)(const char *line)) { s_logger = logger; }
 
 static struct {
 	bool                     ready;
@@ -62,23 +73,30 @@ static struct {
 	/* A small ring of session tickets, keyed by host. Spotify's client talks
 	 * to a handful of hosts in bursts; with a single slot the art fetches and
 	 * API calls kept evicting each other's ticket, forcing a full ECDHE on
-	 * every metadata chunk. Four slots cover the working set. */
-#define TLS_TICKET_SLOTS 4
+	 * every metadata chunk. Eight cover the working set: spclient, i.scdn.co,
+	 * two or three audio CDNs, api, login5, lrclib. */
+#define TLS_TICKET_SLOTS 8
 	mbedtls_ssl_session      ticket[TLS_TICKET_SLOTS];
 	char                     ticket_host[TLS_TICKET_SLOTS][128];
 	bool                     have_ticket[TLS_TICKET_SLOTS];
 	int                      ticket_next;
-	/* The ring and the DRBG below are shared by every network thread --
-	 * player, metadata fetch, download queue, art worker -- and mbedTLS
-	 * contexts are not thread-safe: one handshake freeing or rewriting a
-	 * slot while another was copying it surfaced as a data abort in
-	 * poll() when tracks were skipped quickly. One lock covers both; no
-	 * critical section nests inside another. */
+	/* Every thread that fetches (player, downloads, art, lister) dials
+	 * through here at once, and MBEDTLS_THREADING_C is off: the ticket ring
+	 * and the DRBG are shared state. Unlocked, a handshake finishing on one
+	 * thread freed a ticket another thread was deep-copying, and the heap
+	 * corruption surfaced later as a crash inside poll(). */
 	LightLock                lock;
 } g;
 
-/* The matching slot, or the next victim when the host has none yet.
- * g.lock must be held: the ring is shared by all network threads. */
+static int locked_drbg(void *p, unsigned char *out, size_t len)
+{
+	LightLock_Lock(&g.lock);
+	int rc = mbedtls_ctr_drbg_random(p, out, len);
+	LightLock_Unlock(&g.lock);
+	return rc;
+}
+
+/* The matching slot, or the next victim when the host has none yet. */
 static int ticket_slot(const char *host, bool *found)
 {
 	for (int i = 0; i < TLS_TICKET_SLOTS; i++)
@@ -119,6 +137,7 @@ int tls_global_init(void)
 	if (g.ready)
 		return 0;
 
+	LightLock_Init(&g.lock);
 	mbedtls_entropy_init(&g.entropy);
 	mbedtls_ctr_drbg_init(&g.drbg);
 	mbedtls_x509_crt_init(&g.anchors);
@@ -180,7 +199,10 @@ static int bio_send(void *ctx, const unsigned char *buf, size_t len)
 	tls_conn *c = ctx;
 	int rc = wait_io(c->fd, POLLOUT, c->timeout_ms);
 	if (rc)
-		return rc == MBEDTLS_ERR_SSL_TIMEOUT ? MBEDTLS_ERR_SSL_WANT_WRITE : rc;
+		/* Not WANT_WRITE: the write and handshake loops retry that
+		 * forever, and a dead link would spin there at one poll a turn. */
+		return rc == MBEDTLS_ERR_SSL_TIMEOUT ? MBEDTLS_ERR_SSL_TIMEOUT
+		                                     : MBEDTLS_ERR_NET_SEND_FAILED;
 	int n = send(c->fd, buf, len, 0);
 	if (n < 0)
 		return MBEDTLS_ERR_NET_SEND_FAILED;
@@ -190,15 +212,30 @@ static int bio_send(void *ctx, const unsigned char *buf, size_t len)
 static int bio_recv(void *ctx, unsigned char *buf, size_t len)
 {
 	tls_conn *c = ctx;
+	const u64 t0 = osGetTime();
 	int rc = wait_io(c->fd, POLLIN, c->timeout_ms);
+	c->wait_ms += osGetTime() - t0;
 	if (rc)
 		return rc;
 	int n = recv(c->fd, buf, len, 0);
+	if (n > 0)
+		c->bytes_in += (size_t)n;
 	if (n == 0)
 		return MBEDTLS_ERR_SSL_CONN_EOF;
 	if (n < 0)
 		return MBEDTLS_ERR_NET_RECV_FAILED;
 	return n;
+}
+
+int tls_connect_timeout(int fd, const struct sockaddr *addr,
+                        unsigned addrlen, int timeout_ms)
+{
+	/* A plain blocking connect. The non-blocking + poll version (1.6 test
+	 * build) made every connection fail on hardware -- sign-in died with
+	 * "no internet connection" -- so the deadline waits for a way that is
+	 * proven on the console. */
+	(void)timeout_ms;
+	return connect(fd, addr, addrlen);
 }
 
 static int dial(const char *host, u16 port, int timeout_ms,
@@ -237,7 +274,8 @@ static int dial(const char *host, u16 port, int timeout_ms,
 	/* SOC's connect() has no timeout of its own; a wrong port therefore hangs
 	 * until the console's stack gives up. Spotify's access point on 443 does
 	 * exactly that from some networks, so this is not a hypothetical. */
-	if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+	if (tls_connect_timeout(fd, res->ai_addr, res->ai_addrlen,
+	                        TLS_CONNECT_TIMEOUT_MS) < 0) {
 		snprintf(err, errlen, "connect() to %s:%u failed, errno %d",
 		         host, port, errno);
 		close(fd);
@@ -255,20 +293,9 @@ static int dial(const char *host, u16 port, int timeout_ms,
 
 /* ---------------------------------------------------------------- handshake */
 
-/* The DRBG is as shared as the ring: every handshake draws random from the
- * same context, and ctr_drbg keeps its reseed state between calls. Same
- * lock as the ticket ring; the RNG callback never runs while the caller
- * holds it (ticket lookups and saves happen outside the handshake). */
-static int drbg_random(void *ctx, unsigned char *buf, size_t len)
-{
-	LightLock_Lock(&g.lock);
-	int rc = mbedtls_ctr_drbg_random(ctx, buf, len);
-	LightLock_Unlock(&g.lock);
-	return rc;
-}
-
-tls_conn *tls_connect(const char *host, u16 port, int timeout_ms,
-                      tls_stats *stats, char *err, size_t errlen)
+static tls_conn *connect_impl(const char *host, u16 port, int timeout_ms,
+                              bool verify, tls_stats *stats, char *err,
+                              size_t errlen)
 {
 	tls_stats local = {0};
 	tls_stats *st = stats ? stats : &local;
@@ -288,6 +315,7 @@ tls_conn *tls_connect(const char *host, u16 port, int timeout_ms,
 	}
 	c->timeout_ms = timeout_ms;
 	snprintf(c->host, sizeof(c->host), "%s", host);
+	c->opened_ms = osGetTime();
 
 	c->fd = dial(host, port, timeout_ms, st, err, errlen);
 	if (c->fd < 0) {
@@ -306,9 +334,10 @@ tls_conn *tls_connect(const char *host, u16 port, int timeout_ms,
 
 	mbedtls_ssl_conf_min_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_2);
 	mbedtls_ssl_conf_max_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_2);
-	mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+	mbedtls_ssl_conf_authmode(&c->conf, verify ? MBEDTLS_SSL_VERIFY_REQUIRED
+	                                           : MBEDTLS_SSL_VERIFY_NONE);
 	mbedtls_ssl_conf_ca_chain(&c->conf, &g.anchors, NULL);
-	mbedtls_ssl_conf_rng(&c->conf, drbg_random, &g.drbg);
+	mbedtls_ssl_conf_rng(&c->conf, locked_drbg, &g.drbg);
 	mbedtls_ssl_conf_ciphersuites(&c->conf, SUITES);
 	mbedtls_ssl_conf_groups(&c->conf, GROUPS);
 	mbedtls_ssl_conf_session_tickets(&c->conf, MBEDTLS_SSL_SESSION_TICKETS_ENABLED);
@@ -319,15 +348,17 @@ tls_conn *tls_connect(const char *host, u16 port, int timeout_ms,
 		goto fail;
 	/* Without SNI, Spotify's edge serves the wrong certificate; this call also
 	 * arms the hostname check against the leaf. */
-	if ((rc = mbedtls_ssl_set_hostname(&c->ssl, host)))
+	if (verify && (rc = mbedtls_ssl_set_hostname(&c->ssl, host)))
 		goto fail;
 	bool found = false;
-	int slot;
-	LightLock_Lock(&g.lock);
-	slot = ticket_slot(host, &found);
-	if (found)
-		mbedtls_ssl_set_session(&c->ssl, &g.ticket[slot]);
-	LightLock_Unlock(&g.lock);
+	int slot = -1;
+	if (verify) {
+		LightLock_Lock(&g.lock);
+		slot = ticket_slot(host, &found);
+		if (found)
+			mbedtls_ssl_set_session(&c->ssl, &g.ticket[slot]);
+		LightLock_Unlock(&g.lock);
+	}
 
 	mbedtls_ssl_set_bio(&c->ssl, c, bio_send, bio_recv, NULL);
 
@@ -351,9 +382,7 @@ tls_conn *tls_connect(const char *host, u16 port, int timeout_ms,
 		tls_strerror(rc, reason, sizeof(reason));
 		if (st->verify_flags & (MBEDTLS_X509_BADCERT_FUTURE |
 		                        MBEDTLS_X509_BADCERT_EXPIRED))
-			snprintf(err, errlen,
-			         "certificado fuera de fecha: revisa la FECHA y HORA "
-			         "de la consola en Configuracion");
+			snprintf(err, errlen, TLS_ERR_CLOCK);
 		else
 			snprintf(err, errlen, "handshake: %s (verify 0x%08lX)",
 			         reason, (unsigned long)st->verify_flags);
@@ -373,9 +402,12 @@ tls_conn *tls_connect(const char *host, u16 port, int timeout_ms,
 
 	/* Keep the ticket for the next connection to this host. The slot lookup
 	 * already ran before the handshake: a match is refreshed in place, a miss
-	 * lands on the ring's next victim. Held again here so the free+copy is
-	 * atomic against other threads copying the same slot. */
+	 * lands on the ring's next victim. */
+	if (slot < 0)
+		return c;
 	LightLock_Lock(&g.lock);
+	/* Another thread may have handed this slot to a different host while
+	 * the handshake ran; storing still just overwrites one cache entry. */
 	mbedtls_ssl_session_free(&g.ticket[slot]);
 	mbedtls_ssl_session_init(&g.ticket[slot]);
 	if (mbedtls_ssl_get_session(&c->ssl, &g.ticket[slot]) == 0) {
@@ -432,9 +464,34 @@ void tls_close(tls_conn *c)
 {
 	if (!c)
 		return;
+	/* Only connections that moved real data: the tiny API calls would
+	 * drown the log. */
+	if (s_logger && c->bytes_in >= 32 * 1024) {
+		const u64 total = osGetTime() - c->opened_ms;
+		char line[200];
+		snprintf(line, sizeof(line),
+		         "TLS: %s %u KB in %llu ms, %llu ms waiting on the network, "
+		         "%llu ms working\n",
+		         c->host, (unsigned)(c->bytes_in / 1024),
+		         (unsigned long long)total, (unsigned long long)c->wait_ms,
+		         (unsigned long long)(total > c->wait_ms ? total - c->wait_ms : 0));
+		s_logger(line);
+	}
 	mbedtls_ssl_close_notify(&c->ssl);
 	mbedtls_ssl_free(&c->ssl);
 	mbedtls_ssl_config_free(&c->conf);
 	close(c->fd);
 	free(c);
+}
+
+tls_conn *tls_connect(const char *host, u16 port, int timeout_ms,
+                      tls_stats *stats, char *err, size_t errlen)
+{
+	return connect_impl(host, port, timeout_ms, true, stats, err, errlen);
+}
+
+tls_conn *tls_connect_lan(const char *ip, u16 port, int timeout_ms,
+                          char *err, size_t errlen)
+{
+	return connect_impl(ip, port, timeout_ms, false, NULL, err, errlen);
 }

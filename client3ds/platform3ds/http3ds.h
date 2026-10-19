@@ -84,6 +84,9 @@ int  http_session_request(http_session *s, const char *path,
 void http_session_close(http_session *s);
 /* 1 when the last request reused the open link, 0 when it reconnected. */
 int  http_session_last_reused(const http_session *s);
+/* The last request's split: waiting for the server, then reading the body. */
+void http_session_last_timing(const http_session *s, unsigned *wait_ms,
+                              unsigned *body_ms);
 
 /* Percent-encodes everything outside the unreserved set, for form bodies. */
 size_t url_encode(const char *in, char *out, size_t outlen);

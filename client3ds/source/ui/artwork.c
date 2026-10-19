@@ -67,8 +67,24 @@ bool artwork_fetch_decode(const char *url, int px, uint8_t *out_rgb565,
 
 	http_reply r;
 	memset(&r, 0, sizeof(r));
-	if (http_get_url(url, ART_MAX_BYTES, &r) != 0 ||
-	    (r.status != 200 && r.status != 206)) {
+	/* Covers all come from one host, so the art worker (the only caller)
+	 * keeps one keep-alive link to it. A fresh handshake per thumbnail was
+	 * dozens of handshakes per scrolled list, starving the song playing. */
+	static http_session *img_sess;
+	static const char IMG_PREFIX[] = "https://i.scdn.co/";
+	int rc;
+	if (strncmp(url, IMG_PREFIX, sizeof(IMG_PREFIX) - 1) == 0) {
+		if (!img_sess)
+			img_sess = http_session_open("i.scdn.co");
+		rc = img_sess
+		     ? http_session_request(img_sess, url + sizeof(IMG_PREFIX) - 2,
+		                            "GET", NULL, NULL, NULL, NULL, 0,
+		                            ART_MAX_BYTES, &r)
+		     : -1;
+	} else {
+		rc = http_get_url(url, ART_MAX_BYTES, &r);
+	}
+	if (rc != 0 || (r.status != 200 && r.status != 206)) {
 		snprintf(err, errlen, "%s", r.err[0] ? r.err : "cover fetch failed");
 		http_reply_free(&r);
 		return false;
