@@ -1357,9 +1357,9 @@ static int clamp_row(int sel, int total)
 
 static bool casting(void);
 
-/* START while a song plays: jump to its artist or album, or on to the
- * settings. Same modal pattern as the settings sheet, three rows. */
-#define ACT_ROWS 9
+/* X: the actions window -- play next, add to playlist, download the list,
+ * artist, album, radio, visualizer, delete download, cast, settings. */
+#define ACT_ROWS 10
 #define ACT_ROW0 0x7200
 static bool actions_open = false;
 static int  actions_sel = 0;
@@ -1372,9 +1372,9 @@ static struct {
 	native_row row;
 } act;
 
-/* Rows: 0 play next, 1 add to playlist, 2 artist, 3 album, 4 radio,
- * 5 visualizer, 6 delete download, 7 play on the speaker (or back),
- * 8 settings. Delete takes two presses:
+/* Rows: 0 play next, 1 add to playlist, 2 download this list, 3 artist,
+ * 4 album, 5 radio, 6 visualizer, 7 delete download, 8 play on the speaker
+ * (or back), 9 settings. Delete takes two presses:
  * the first only arms it. */
 static bool act_delete_armed = false;
 static bool unlink_armed = false;
@@ -1391,12 +1391,13 @@ static bool action_enabled(int row)
 {
 	if (row == 0) return act.has_row;
 	if (row == 1) return act_track_uri()[0] != '\0' && !native_offline();
-	if (row == 2) return act.artist_uri[0] != '\0';
-	if (row == 3) return act.album_uri[0] != '\0';
-	if (row == 4) return act_track_uri()[0] != '\0' && !native_offline();
-	if (row == 5) return vis_open || native_now_uri()[0] != '\0';
-	if (row == 6) return act.has_row && strncmp(act.row.uri, "file:", 5) == 0;
-	if (row == 7) {
+	if (row == 2) return list_downloadable() && !native_offline();
+	if (row == 3) return act.artist_uri[0] != '\0';
+	if (row == 4) return act.album_uri[0] != '\0';
+	if (row == 5) return act_track_uri()[0] != '\0' && !native_offline();
+	if (row == 6) return vis_open || native_now_uri()[0] != '\0';
+	if (row == 7) return act.has_row && strncmp(act.row.uri, "file:", 5) == 0;
+	if (row == 8) {
 		if (casting())
 			return true;
 		if (native_offline() || native_cast_finding())
@@ -1456,13 +1457,17 @@ static void draw_actions(const Skin *sk)
 	C2D_DrawRectSolid(0.0f, 0.0f, 0.6f, BOT_W, SCR_H, scrim);
 
 	/* The track the menu is about gets its own lighter cell at the top,
-	 * like the row context menu; the options below stay one line each.
-	 * Rows 2/3 name their target so the choice reads without a sub line. */
+	 * one line ("track · artist") so the ten options fit below it.
+	 * Rows 3/4 name their target so the choice reads without a sub line. */
 	const char *track = act.has_row ? act.row.label : now_title;
 	const char *who   = act.has_row ? act.row.sub : now_artist;
 	const bool has_head = track[0] != '\0';
-	const bool has_sub  = has_head && who[0] != '\0';
-	const float head_h = has_head ? (has_sub ? 40.0f : 28.0f) : 0.0f;
+	const float head_h = has_head ? 28.0f : 0.0f;
+	char head[180];
+	if (has_head && who[0])
+		snprintf(head, sizeof(head), "%s · %s", track, who);
+	else
+		snprintf(head, sizeof(head), "%s", track);
 
 	char cast_label[80];
 	const bool find_row = cast_find_row || native_cast_count() == 0;
@@ -1487,7 +1492,7 @@ static void draw_actions(const Skin *sk)
 	else
 		snprintf(go_album, sizeof(go_album), "%s", tr(S_GO_ALBUM));
 	const char *labels[ACT_ROWS] = { tr(S_PLAY_NEXT), tr(S_ADD_TO_PL),
-	                                 go_artist, go_album,
+	                                 tr(S_DL_LIST), go_artist, go_album,
 	                                 tr(S_GO_RADIO),
 	                                 tr(vis_open ? S_VIS_STOP : S_VIS_START),
 	                                 tr(act_delete_armed ? S_DELETE_CONFIRM
@@ -1495,10 +1500,10 @@ static void draw_actions(const Skin *sk)
 	                                 cast_label,
 	                                 tr(S_SETTINGS) };
 	/* Rounded card like the row context menu. Row text is 14px tall and
-	 * ui_baseline(TOP) returns TOP + 11.7px, so a 19px row with the text
+	 * ui_baseline(TOP) returns TOP + 11.7px, so an 18px row with the text
 	 * top 2px in keeps the glyphs clear of the next row's pill. */
 	const float pw = 264.0f, px = (BOT_W - pw) / 2.0f;
-	const float rh = 19.0f;
+	const float rh = 18.0f;
 	const float ph = 8.0f + head_h + (has_head ? 6.0f : 0.0f) +
 	                 (float)ACT_ROWS * rh + 10.0f;
 	const float py = (SCR_H - ph) / 2.0f;
@@ -1509,13 +1514,9 @@ static void draw_actions(const Skin *sk)
 	float ry = py + 8.0f;
 	if (has_head) {
 		rounded_rect(cx, ry, cw, head_h, 6.0f, cell);
-		ui_text(text_buf, track, cx + 10.0f,
-		        ui_baseline(ry + 5.0f, TY_ROW_NAME), TY_ROW_NAME,
+		ui_text(text_buf, head, cx + 10.0f,
+		        ui_baseline(ry + 7.0f, TY_ROW_NAME), TY_ROW_NAME,
 		        cw - 20.0f, sk->text);
-		if (has_sub)
-			ui_text(text_buf, who, cx + 10.0f,
-			        ui_baseline(ry + 21.0f, TY_ROW_SUB), TY_ROW_SUB,
-			        cw - 20.0f, sk->dim);
 		ry += head_h + 6.0f;
 	}
 	for (int i = 0; i < ACT_ROWS; i++) {
@@ -3129,7 +3130,7 @@ int main(int argc, char **argv)
 			if (down & KEY_DDOWN)
 				actions_sel = actions_sel + 1 < ACT_ROWS ? actions_sel + 1 : 0;
 			const int ncast = native_cast_count();
-			if (actions_sel == 7 && !casting() && ncast > 0 &&
+			if (actions_sel == 8 && !casting() && ncast > 0 &&
 			    !native_cast_finding() &&
 			    (down & (KEY_DLEFT | KEY_DRIGHT))) {
 				const int dir = (down & KEY_DRIGHT) ? +1 : -1;
@@ -3145,7 +3146,7 @@ int main(int argc, char **argv)
 			if (g_touch.clicked >= ACT_ROW0 &&
 			    g_touch.clicked < ACT_ROW0 + ACT_ROWS)
 				row = g_touch.clicked - ACT_ROW0;
-			if (row == 6 && action_enabled(6) && !act_delete_armed) {
+			if (row == 7 && action_enabled(7) && !act_delete_armed) {
 				act_delete_armed = true;   /* ask once more */
 				row = -1;
 			}
@@ -3162,7 +3163,15 @@ int main(int argc, char **argv)
 						pick_open = true;
 					else
 						toast_show(tr(S_PL_NONE));
-				} else if (row == 4) {
+				} else if (row == 2) {
+					/* The open list (or Liked): only the songs not
+					 * on the card yet are queued. */
+					if (native_dl_enqueue_list(nat_rows, nat_count,
+					                           nat_title) > 0)
+						queue_open = true;
+					else
+						toast_show(tr(S_DL_ALL_SAVED));
+				} else if (row == 5) {
 					/* A radio seeded from the song, as X does in a list. */
 					snprintf(nat_arg, sizeof(nat_arg), "%s", act_track_uri());
 					nat_view = NATIVE_RADIO;
@@ -3172,16 +3181,16 @@ int main(int argc, char **argv)
 					native_fetch_cancel();
 					lib.scroll = lib.velocity = 0.0f;
 					lib_reload = true;
-				} else if (row == 5) {
+				} else if (row == 6) {
 					vis_open = !vis_open;
 					if (vis_open)
 						lib.open = false;   /* the player stays below */
-				} else if (row == 6) {
+				} else if (row == 7) {
 					act_delete_armed = false;
 					native_delete_download(act.row.uri);
 					lib_reload = true;   /* the Downloads list rereads the card */
 					nat_loaded_view = (native_view)-1;
-				} else if (row == 7) {
+				} else if (row == 8) {
 					if (casting()) {
 						cast_finish();
 					} else if (cast_find_row || native_cast_count() == 0) {
@@ -3190,7 +3199,7 @@ int main(int argc, char **argv)
 					} else {
 						cast_begin();
 					}
-				} else if (row == 8) {
+				} else if (row == 9) {
 					settings_open = true;
 					settings_sel = 0;
 				} else {
@@ -3198,9 +3207,9 @@ int main(int argc, char **argv)
 					 * on the nav stack: B comes back to the list the
 					 * menu was opened from. */
 					open_library_view(NATIVE_TRACKS,
-					                  row == 2 ? act.artist_uri
+					                  row == 3 ? act.artist_uri
 					                           : act.album_uri,
-					                  row == 2 ? act.artist : act.album);
+					                  row == 3 ? act.artist : act.album);
 				}
 			}
 			if (down & (KEY_B | KEY_START))
@@ -3269,15 +3278,15 @@ int main(int argc, char **argv)
 			down = 0;
 		} else if (down & KEY_X) {
 			/* X opens the actions menu: play next, add to playlist,
-			 * artist, album, radio, visualizer, delete download,
-			 * play on a speaker, settings. With nothing it can act
-			 * on, it falls straight through to the settings. */
+			 * download this list, artist, album, radio, visualizer,
+			 * delete download, play on a speaker, settings. With nothing
+			 * it can act on, it falls straight through to the settings. */
 			if (actions_capture()) {
 				actions_open = true;
 				act_delete_armed = false;
 				/* In Downloads the likely wish is the delete row. */
-				actions_sel = strncmp(act.row.uri, "file:", 5) == 0 ? 6
-				              : (act.has_row ? 0 : 5);
+				actions_sel = strncmp(act.row.uri, "file:", 5) == 0 ? 7
+				              : (act.has_row ? 0 : 6);
 			} else {
 				settings_open = true;
 				settings_sel = 0;
