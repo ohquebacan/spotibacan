@@ -1196,16 +1196,23 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 		const u32 frame = sk->dim;
 		const u32 fill = bat_charging ? sk->accent :
 		                 bat_level <= 20 ? sk->warm : sk->dim;
-		/* The download counter keeps it company on the left, same baseline
-		 * as the clock and only while something is actually queueing. */
+		/* One right-aligned string left of the icon: optional download
+		 * counter, the clock, then the battery percentage (a "+" while
+		 * charging). Low battery tints the whole string warm. */
+		char right[56];
+		int len = 0;
 		int q_done = 0, q_total = 0;
 		native_dl_progress(&q_done, &q_total);
-		if (q_total > 0) {
-			char dl_txt[24];
-			snprintf(dl_txt, sizeof(dl_txt), "DL %d/%d", q_done, q_total);
-			text_at(dl_txt, bx - 40.0f, by - 3.0f, 0.42f, sk->dim,
-			        C2D_AlignRight);
-		}
+		if (q_total > 0)
+			len += snprintf(right + len, sizeof(right) - len,
+			                "DL %d/%d  ", q_done, q_total);
+		len += snprintf(right + len, sizeof(right) - len, "%s  ", clock_txt);
+		len += snprintf(right + len, sizeof(right) - len, "%s%d%%",
+		                bat_charging ? "+" : "", bat_level);
+		const u32 stat_col = bat_level <= 20 && !bat_charging ? sk->warm
+		                                                      : sk->dim;
+		text_at(right, bx - 6.0f, by - 3.0f, 0.42f, stat_col,
+		        C2D_AlignRight);
 		C2D_DrawRectSolid(bx, by, 0.2f, 16.0f, 8.0f, frame);
 		C2D_DrawRectSolid(bx + 16.0f, by + 2.0f, 0.2f, 2.0f, 4.0f, frame);
 		float w = 14.0f * (float)bat_level / 100.0f;
@@ -1213,10 +1220,6 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 			w = 14.0f;
 		if (w > 0.0f)
 			C2D_DrawRectSolid(bx + 1.0f, by + 1.0f, 0.3f, w, 6.0f, fill);
-		/* The clock shares the battery's vertical centre: at by-1 the text
-		 * sat a couple of pixels low against the 8px-tall battery body. */
-		text_at(clock_txt, bx - 8.0f, by - 3.0f, 0.42f, sk->dim,
-		        C2D_AlignRight);
 	}
 
 	// Last, above whatever the top screen shows: it only reports, and the
@@ -1493,8 +1496,18 @@ static void draw_actions(const Skin *sk)
 	const u32 scrim  = C2D_Color32(0x00, 0x00, 0x00, 0x98);
 	const u32 bord   = C2D_Color32(0x38, 0x38, 0x38, 0xFF);
 	const u32 panel  = C2D_Color32(0x1B, 0x1B, 0x1B, 0xFF);
+	const u32 cell   = C2D_Color32(0x24, 0x24, 0x24, 0xFF);
 	const u32 hilite = C2D_Color32(0x2E, 0x2E, 0x2E, 0xFF);
 	C2D_DrawRectSolid(0.0f, 0.0f, 0.6f, BOT_W, SCR_H, scrim);
+
+	/* The track the menu is about gets its own lighter cell at the top,
+	 * like the row context menu; the options below stay one line each.
+	 * Rows 2/3 name their target so the choice reads without a sub line. */
+	const char *track = act.has_row ? act.row.label : now_title;
+	const char *who   = act.has_row ? act.row.sub : now_artist;
+	const bool has_head = track[0] != '\0';
+	const bool has_sub  = has_head && who[0] != '\0';
+	const float head_h = has_head ? (has_sub ? 40.0f : 28.0f) : 0.0f;
 
 	char cast_label[80];
 	const bool find_row = cast_find_row || native_cast_count() == 0;
@@ -1507,35 +1520,49 @@ static void draw_actions(const Skin *sk)
 	else
 		snprintf(cast_label, sizeof(cast_label), tr(S_CAST_TO),
 		         native_cast_name());
+	char go_artist[120], go_album[120];
+	if (act.artist[0])
+		snprintf(go_artist, sizeof(go_artist), "%s · %s",
+		         tr(S_GO_ARTIST), act.artist);
+	else
+		snprintf(go_artist, sizeof(go_artist), "%s", tr(S_GO_ARTIST));
+	if (act.album[0])
+		snprintf(go_album, sizeof(go_album), "%s · %s",
+		         tr(S_GO_ALBUM), act.album);
+	else
+		snprintf(go_album, sizeof(go_album), "%s", tr(S_GO_ALBUM));
 	const char *labels[ACT_ROWS] = { tr(S_PLAY_NEXT), tr(S_ADD_TO_PL),
-	                                 tr(S_GO_ARTIST), tr(S_GO_ALBUM),
+	                                 go_artist, go_album,
 	                                 tr(S_GO_RADIO),
 	                                 tr(vis_open ? S_VIS_STOP : S_VIS_START),
 	                                 tr(act_delete_armed ? S_DELETE_CONFIRM
 	                                                     : S_DELETE_DL),
 	                                 cast_label,
 	                                 tr(S_SETTINGS) };
-	/* Left/right on the row walks the speakers, then "Find speakers". */
-	char cast_sub[64] = "";
-	if (!casting() && find_row)
-		snprintf(cast_sub, sizeof(cast_sub), "%s", tr(S_CAST_FIND_SUB));
-	else if (!casting())
-		snprintf(cast_sub, sizeof(cast_sub), tr(S_CAST_PICK),
-		         native_cast_current() + 1, native_cast_count());
-	const char *subs[ACT_ROWS] = { act.has_row ? act.row.label : "", "",
-	                               act.artist, act.album, "", "", "",
-	                               cast_sub, "" };
-	/* The same rounded card as the row context menu: nine rows, a grey
-	 * pill on the selection, the sub line under the selected row. */
+	/* Rounded card like the row context menu. Row text is 14px tall and
+	 * ui_baseline(TOP) returns TOP + 11.7px, so a 19px row with the text
+	 * top 2px in keeps the glyphs clear of the next row's pill. */
 	const float pw = 264.0f, px = (BOT_W - pw) / 2.0f;
-	const float rh = 22.0f;
-	const float ph = 16.0f + (float)ACT_ROWS * rh + 12.0f;
+	const float rh = 19.0f;
+	const float ph = 8.0f + head_h + (has_head ? 6.0f : 0.0f) +
+	                 (float)ACT_ROWS * rh + 10.0f;
 	const float py = (SCR_H - ph) / 2.0f;
 	round_panel(px, py, pw, ph, 8.0f, bord, panel);
 
 	ui_depth(0.7f);
 	const float cx = px + 8.0f, cw = pw - 16.0f;
-	const float ry = py + 8.0f;
+	float ry = py + 8.0f;
+	if (has_head) {
+		rounded_rect(cx, ry, cw, head_h, 6.0f, cell);
+		ui_text(text_buf, track, cx + 10.0f,
+		        ui_baseline(ry + 5.0f, TY_ROW_NAME), TY_ROW_NAME,
+		        cw - 20.0f, sk->text);
+		if (has_sub)
+			ui_text(text_buf, who, cx + 10.0f,
+			        ui_baseline(ry + 21.0f, TY_ROW_SUB), TY_ROW_SUB,
+			        cw - 20.0f, sk->dim);
+		ry += head_h + 6.0f;
+	}
 	for (int i = 0; i < ACT_ROWS; i++) {
 		const float y = ry + (float)i * rh;
 		const bool on = action_enabled(i);
@@ -1543,15 +1570,9 @@ static void draw_actions(const Skin *sk)
 		    (g_touch.down && g_touch.press_id == ACT_ROW0 + i);
 		if (sel)
 			rounded_rect(cx, y + 1.0f, cw, rh - 2.0f, 6.0f, hilite);
-		const bool show_sub = subs[i][0] && i == actions_sel;
-		const u32 fg = on ? sk->text : sk->dim;
 		ui_text(text_buf, labels[i], cx + 12.0f,
-		        ui_baseline(y + (show_sub ? 8.0f : rh / 2.0f), TY_ROW_NAME),
-		        TY_ROW_NAME, cw - 24.0f, fg);
-		if (show_sub)
-			ui_text(text_buf, subs[i], cx + 12.0f,
-			        ui_baseline(y + 19.0f, TY_ROW_SUB), TY_ROW_SUB,
-			        cw - 24.0f, sk->dim);
+		        ui_baseline(y + 2.0f, TY_ROW_NAME), TY_ROW_NAME,
+		        cw - 24.0f, on ? sk->text : sk->dim);
 		tb_add(&g_tb, cx, y, cw, rh, ACT_ROW0 + i);
 	}
 	/* The full-screen closer registers last: taps on the scrim fall
@@ -1595,7 +1616,7 @@ static void draw_pick(const Skin *sk)
 		    (g_touch.down && g_touch.press_id == ACT_ROW0 + 0x40 + i))
 			rounded_rect(cx, y + 1.0f, cw, rh - 2.0f, 6.0f, hilite);
 		ui_text(text_buf, pick_rows[idx].label, cx + 12.0f,
-		        ui_baseline(y + rh / 2.0f, TY_ROW_NAME), TY_ROW_NAME,
+		        ui_baseline(y + 6.0f, TY_ROW_NAME), TY_ROW_NAME,
 		        cw - 24.0f, sk->text);
 		tb_add(&g_tb, cx, y, cw, rh, ACT_ROW0 + 0x40 + i);
 	}
@@ -2732,24 +2753,6 @@ auto_advance = true;
 
 // What activating an absolute list row means: the synthetic Liked Songs or
 // Downloads rows, drilling into a playlist, or playing a track.
-/* One step up: a saved playlist inside Downloads goes back to Downloads,
- * everything else to the playlists. */
-static void lib_back(void)
-{
-	if (nat_view == NATIVE_DOWNLOADS && nat_arg[0]) {
-		nat_arg[0] = '\0';
-		snprintf(nat_title, sizeof(nat_title), "%s", tr(S_DL_VIEW));
-	} else {
-		nat_view = NATIVE_PLAYLISTS;
-		nat_arg[0] = '\0';
-		snprintf(nat_title, sizeof(nat_title), "%s", tr(S_LISTS));
-	}
-	lib.sel = 0;
-	native_fetch_cancel();   /* drop the old view's in-flight fetch */
-	lib.scroll = lib.velocity = 0.0f;
-	lib_reload = true;
-}
-
 static void activate_row(int abs)
 {
 	int extra = (nat_view == NATIVE_PLAYLISTS) ? 2 : 0;
@@ -3423,6 +3426,12 @@ int main(int argc, char **argv)
 		} else if (down & KEY_SELECT) {
 			help_open = true;
 			down = 0;
+		} else if (down & KEY_START) {
+			// START opens the settings menu, as before the actions
+			// window moved to X.
+			settings_open = true;
+			settings_sel = 0;
+			down = 0;
 		} else if (down & KEY_X) {
 			/* X opens the actions menu: play next, add to playlist,
 			 * artist, album, radio, visualizer, delete download,
@@ -3441,11 +3450,20 @@ int main(int argc, char **argv)
 			down = 0;
 		}
 
+		/* A window (actions, picker, settings, ...) owns every key and the
+		 * drag while it is open. nav_repeat polls the D-pad straight off
+		 * the hardware and the scrub follows press_id, so without this
+		 * flag the list or the seekbar below a window still reacts in
+		 * step with the menu's own cursor. */
+		const bool modal_open = actions_open || pick_open || settings_open ||
+		                        ctx_open || queue_open || srch_open ||
+		                        help_open;
+
 		// A scrub is a drag, not a tap: the position follows the finger while
 		// held (a preview only -- the decoder keeps playing), and the seek
 		// fires on release.
 		static bool scrubbing = false;
-		if (!lib.open && !lyr_open && now_dur > 1.0f) {
+		if (!lib.open && !lyr_open && !modal_open && now_dur > 1.0f) {
 			if (g_touch.pressed && g_touch.press_id == BTN_P_SCRUB)
 				scrubbing = true;
 		} else {
@@ -3640,7 +3658,9 @@ int main(int argc, char **argv)
 			}
 		}
 
-		if (lib.open) {
+		/* The library answers keys only when no window owns them
+		 * (see modal_open above). */
+		if (lib.open && !modal_open) {
 			static nav_hold lib_hold;
 			const int step = nav_repeat(&lib_hold, down);
 			if (step && lib.total)

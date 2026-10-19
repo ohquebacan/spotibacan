@@ -6,12 +6,13 @@
 
 /* The overlay lives on the top screen now: on the bottom one it covered the
  * transport controls it only reports on. A slim pill across the upper edge
- * stays clear of both the cover art and the text column below it. */
+ * stays clear of both the cover art and the text column below it: the art
+ * and the title start at y=30, so 4..26 keeps a clean gap. */
 #define TOP_W   400.0f
 #define PANEL_W 210.0f
-#define PANEL_H 30.0f
+#define PANEL_H 22.0f
 #define PANEL_X ((TOP_W - PANEL_W) / 2.0f)
-#define PANEL_Y 8.0f
+#define PANEL_Y 4.0f
 
 static u32 color(u8 r, u8 g, u8 b, u8 alpha, u8 fade)
 {
