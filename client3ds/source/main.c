@@ -2175,7 +2175,39 @@ static void draw_bottom(const Skin *sk)
 		a.panel = sk->panel;
 		screen_player_draw(&a);
 	}
-	text_at(BUILD_STAMP, BOT_W - 6, SCR_H - 14, 0.40f, sk->meter, C2D_AlignRight);
+
+	/* A download in flight gets a slim pill along the bottom edge, on top of
+	 * whatever view is open: the queue popup has the details; this one only
+	 * reports progress at a glance. Modal windows draw over it. */
+	char dl_title[128];
+	const int dl_pct = native_dl_active(dl_title, sizeof(dl_title));
+	if (dl_pct >= 0) {
+		const float px = 20.0f, py = 215.0f, pw = 280.0f, ph = 20.0f;
+		const bool saving = dl_pct == NATIVE_DL_SAVING;
+		const u32 border = C2D_Color32(0x38, 0x38, 0x38, 0xFF);
+		const u32 panel  = C2D_Color32(0x1B, 0x1B, 0x1B, 0xFF);
+		const u32 track  = C2D_Color32(0x35, 0x35, 0x35, 0xFF);
+		round_panel(px, py, pw, ph, 9.0f, border, panel);
+		ui_depth(0.7f);
+		char pc[12];
+		snprintf(pc, sizeof(pc), "%d%%", saving ? 100 : dl_pct);
+		const float pc_w = ui_text_width(text_buf, pc, TY_MICRO);
+		ui_text(text_buf, pc, px + pw - 12.0f - pc_w,
+		        ui_baseline(py + 5.0f, TY_MICRO), TY_MICRO, pc_w, sk->accent);
+		ui_text(text_buf, dl_title, px + 12.0f,
+		        ui_baseline(py + 5.0f, TY_MICRO), TY_MICRO,
+		        pw - 24.0f - pc_w - 8.0f, sk->text);
+		const float fill = saving ? 1.0f : (float)dl_pct / 100.0f;
+		C2D_DrawRectSolid(px + 12.0f, py + 14.0f, 0.7f, pw - 24.0f, 3.0f,
+		                  track);
+		if (fill > 0.0f)
+			C2D_DrawRectSolid(px + 12.0f, py + 14.0f, 0.7f,
+			                  (pw - 24.0f) * fill, 3.0f, sk->accent);
+		ui_depth(0.0f);
+	} else {
+		text_at(BUILD_STAMP, BOT_W - 6, SCR_H - 14, 0.40f, sk->meter,
+		        C2D_AlignRight);
+	}
 
 	if (settings_open) {
 		// Modal: it replaces the touch map so the view below cannot answer
