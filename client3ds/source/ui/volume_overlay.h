@@ -9,6 +9,7 @@ typedef struct {
 	u8          alpha;      /* 0 draws nothing */
 } volume_overlay_args;
 
-/* Drawn above the completed bottom-screen view. The overlay has no touch
- * area: it only reports. */
+/* Drawn over the top screen at the left edge, beside the cover: a bare
+ * vertical line with the percent on top. The overlay has no touch area:
+ * it only reports. */
 void volume_overlay_draw(const volume_overlay_args *a);
