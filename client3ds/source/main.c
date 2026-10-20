@@ -1116,13 +1116,12 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 		}
 	}
 
-	/* Status corner: clock and battery, fixed to the glass like the volume
-	 * overlay -- status does not ride the parallax layers. Polled at most
-	 * once a second: draw_top runs twice per frame and the service calls
-	 * are syscalls. The battery body is a solid frame with the fill on
-	 * top: charging breathes in the accent, a fifth left turns it warm.
-	 * Percent comes from the MCU (mcu:hwc, already up for the volume
-	 * slider); charging comes from ptm:u. */
+	/* Status corner: clock and battery percent, fixed to the glass like the
+	 * volume overlay -- status does not ride the parallax layers. Polled at
+	 * most once a second: draw_top runs twice per frame and the service
+	 * calls are syscalls. The battery is the number alone: charging reads
+	 * in the accent, a fifth left turns it warm. Percent comes from the MCU
+	 * (mcu:hwc, already up for the volume slider); charging from ptm:u. */
 	static u64 status_at = 0;
 	static char clock_txt[8] = "--:--";
 	static u8 bat_level = 0;      /* percent, 0-100 */
@@ -1142,13 +1141,10 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 			bat_charging = chg != 0;
 	}
 	{
-		/* Apple-style battery: the percentage lives inside the body, so
-		 * the status string carries only the download counter and the
-		 * clock. Body 24x12 with a 3px nub. */
-		const float bx = TOP_W - 34.0f, by = 10.0f;
-		const u32 frame = sk->dim;
-		const u32 fill = bat_charging ? sk->accent :
-		                 bat_level <= 20 ? sk->warm : sk->dim;
+		/* Percent only, no icon: charging reads in the accent, a fifth left
+		 * turns it warm, otherwise it matches the status text. The number
+		 * owns the corner; the status string steps aside for it. */
+		const float bx = TOP_W - 10.0f, by = 10.0f;
 		char right[48];
 		int len = 0;
 		int q_done = 0, q_total = 0;
@@ -1159,22 +1155,13 @@ static void draw_top(const Skin *sk, bool buffering, bool muted, float par)
 		len += snprintf(right + len, sizeof(right) - len, "%s", clock_txt);
 		const u32 stat_col = bat_level <= 20 && !bat_charging ? sk->warm
 		                                                      : sk->dim;
-		text_at(right, bx - 6.0f, by - 1.0f, 0.42f, stat_col,
+		text_at(right, bx - 38.0f, by - 1.0f, 0.42f, stat_col,
 		        C2D_AlignRight);
-		/* Frame, nub, then the level fill under the number. */
-		C2D_DrawRectSolid(bx, by, 0.2f, 24.0f, 12.0f, frame);
-		C2D_DrawRectSolid(bx + 24.0f, by + 3.0f, 0.2f, 3.0f, 6.0f, frame);
-		float w = 22.0f * (float)bat_level / 100.0f;
-		if (bat_charging)
-			w = 22.0f;
-		if (w > 0.0f)
-			C2D_DrawRectSolid(bx + 1.0f, by + 1.0f, 0.3f, w, 10.0f, fill);
-		/* The number sits centred in the body, in light ink so it reads
-		 * over both the fill and the dark frame. */
 		char pct[8];
-		snprintf(pct, sizeof(pct), "%d", bat_level);
-		text_at(pct, bx + 12.0f, by + 9.5f, 0.32f, sk->text,
-		        C2D_AlignCenter);
+		snprintf(pct, sizeof(pct), "%d%%", bat_level);
+		const u32 pct_col = bat_charging ? sk->accent :
+		                    bat_level <= 20 ? sk->warm : sk->text;
+		text_at(pct, bx, by - 1.0f, 0.42f, pct_col, C2D_AlignRight);
 	}
 
 	// Last, above whatever the top screen shows: it only reports, and the

@@ -73,6 +73,7 @@ def main():
     stamp = time.strftime("%H:%M:%S")
     flags = ["-std=gnu11", "-Wall", "-Wextra", "-D__3DS__",
              f'-DBUILD_STAMP="{stamp}"',
+             '-DAPP_VERSION="1.2"',
              "-O0" if args.debug else "-O2", "-g",
              "-ffunction-sections", "-fdata-sections", "-fshort-enums", *defines]
     includes = list(tc.includes)
@@ -166,7 +167,7 @@ def build_cia(root: Path, elf: Path):
                     str(elf), "-rsf", str(rsf), "-target", "t", "-exefslogo",
                     "-icon", str(root / "assets/icon.smdh"), "-banner",
                     str(root / "build/banner.bnr"),
-                    "-major", "0", "-minor", "1", "-micro", "0"], check=True)
+                    "-major", "1", "-minor", "2", "-micro", "0"], check=True)
     print(f"Built {cia}  ({cia.stat().st_size:,} bytes)  - install with FBI")
 
 
