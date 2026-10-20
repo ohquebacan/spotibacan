@@ -32,6 +32,17 @@ void http3ds_locks_init(void)
 	LightLock_Init(&dns_lock);
 }
 
+/* Set while the HOME menu owns the console: download loops trickle one piece
+ * per 100 ms instead of saturating the system core, so the menu opens
+ * instantly even mid-download. Pieces keep landing, so the stream's stall
+ * clock never trips. */
+static volatile bool s_throttled;
+
+void http3ds_set_throttled(bool on)
+{
+	s_throttled = on;
+}
+
 /* newlib hides strcasestr behind _GNU_SOURCE; header names are few and short,
  * so a plain scan is cheaper than reasoning about feature macros. */
 static bool header_present(const char *headers, const char *needle)
@@ -519,6 +530,11 @@ int http_get_url_stream(const char *url, size_t offset,
 	}
 	int rc = 0;
 	for (;;) {
+		/* The HOME menu borrows the whole console: trickle the body while
+		 * it is up so the menu answers at once. Pieces still land, so the
+		 * caller's stall clock never trips. */
+		while (s_throttled)
+			svcSleepThread(100000000LL);   // 100 ms
 		int r = tls_read(c, piece, STREAM_PIECE);
 		if (r == 0)
 			break;

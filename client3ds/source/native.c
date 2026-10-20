@@ -285,6 +285,11 @@ static struct {
 
 void native_set_downloads(bool on) { g.downloads_on = on; }
 
+void native_set_net_throttled(bool on)
+{
+	http3ds_set_throttled(on);
+}
+
 /* Network workers go to the system core when the app has been granted
  * time there (main sets that up): decrypting TLS and the audio file is
  * what the console's CPU spends most on, and on the app core it queued

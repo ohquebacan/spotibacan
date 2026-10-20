@@ -37,6 +37,10 @@ int http_get_proto(const char *host, const char *path, const char *bearer,
 /* The general form the ones above are built from. `bearer`, `ctype` and
  * `accept` may be NULL. `limit` caps the response body; 0 uses the default,
  * which is sized for API replies, not for audio. */
+/* While the HOME menu owns the console, download loops trickle instead of
+ * saturating the system core: one body piece per 100 ms. */
+void http3ds_set_throttled(bool on);
+
 int http_request(const char *host, const char *path, const char *method,
                  const char *bearer, const char *ctype, const char *accept,
                  const void *body, size_t len, size_t limit, http_reply *out);

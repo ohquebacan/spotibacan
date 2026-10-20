@@ -198,6 +198,8 @@ bool native_dl_queue_entry(int i, char *title, size_t titlelen);
 /* The download the queue is running right now: 0-100, or -1 when idle.
  * title_out gets its name when active. */
 int  native_dl_active(char *title_out, size_t titlelen);
+/* HOME menu up: trickle downloads so the system cores answer at once. */
+void native_set_net_throttled(bool on);
 /* Casting to the one speaker named in cast.txt. The calls only post a
  * request; a worker does the network. Starting wakes the speaker and signs
  * it in to Spotify, then plays `context_uri` from `track_uri` (may be "")

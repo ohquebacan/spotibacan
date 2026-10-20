@@ -2827,8 +2827,12 @@ static void apt_event(APT_HookType hook, void *param)
 	switch (hook) {
 	case APTHOOK_ONSLEEP:   native_log("APT: sleep\n"); break;
 	case APTHOOK_ONWAKEUP:  native_log("APT: wake\n"); native_on_wake(); break;
-	case APTHOOK_ONSUSPEND: native_log("APT: HOME\n"); break;
-	case APTHOOK_ONRESTORE: native_log("APT: back from HOME\n"); break;
+	case APTHOOK_ONSUSPEND: native_log("APT: HOME\n");
+		native_set_net_throttled(true);
+		break;
+	case APTHOOK_ONRESTORE: native_log("APT: back from HOME\n");
+		native_set_net_throttled(false);
+		break;
 	default: break;
 	}
 }
